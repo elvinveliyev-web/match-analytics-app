@@ -8,8 +8,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from sklearn.linear_model import LogisticRegression
-
 # =========================================================
 # PAGE
 # =========================================================
@@ -21,11 +19,14 @@ st.caption(
 )
 
 # =========================================================
-# CONFIG
+# SOURCES
 # =========================================================
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
+NEW_LEAGUE_URL = "https://www.football-data.co.uk/new/{div}.csv"  # Extra leagues often here
 
-# İsimli lig listesi (okunabilirlik için)
+# =========================================================
+# LEAGUE LIST (Manually named + auto-discovery from fixtures)
+# =========================================================
 LEAGUES = {
     # Turkey
     "Turkey - Süper Lig (T1)": "T1",
@@ -59,12 +60,11 @@ LEAGUES = {
     "Portugal - Primeira Liga (P1)": "P1",
     "Greece - Super League (G1)": "G1",
 
-    # Others (often available)
-    "Austria - Bundesliga (A1)": "A1",
-    "Switzerland - Super League (SW1)": "SW1",
-    "Denmark - Superliga (DN1)": "DN1",
-    "Norway - Eliteserien (NO1)": "NO1",
-    "Sweden - Allsvenskan (S1)": "S1",
+    # Extra leagues (football-data 'Extra Leagues')
+    "USA - MLS (USA)": "USA",
+    "Argentina - Primera División (ARG)": "ARG",
+    "Brazil - Serie A (BRA)": "BRA",
+    "Mexico - Liga MX (MEX)": "MEX",
 }
 
 # football-data odds setleri (1X2)
@@ -87,10 +87,17 @@ def season_code(start_year: int) -> str:
     return f"{y1:02d}{y2:02d}"
 
 def season_start_year_for_date(d: dt.date) -> int:
+    # European season logic (Jul->Jun)
     return d.year if d.month >= 7 else d.year - 1
 
 def hist_url(season: str, div: str) -> str:
     return f"https://www.football-data.co.uk/mmz4281/{season}/{div}.csv"
+
+def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    return df
 
 def safe_float(x):
     try:
@@ -105,15 +112,15 @@ def safe_float(x):
     except Exception:
         return np.nan
 
-def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    return df
-
 @st.cache_data(show_spinner=False)
 def load_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=45)
+    # Slightly more robust headers (some endpoints are picky)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)",
+        "Accept": "text/csv,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+    }
+    r = requests.get(url, timeout=45, headers=headers)
     r.raise_for_status()
     from io import StringIO
     txt = r.content.decode("latin-1", errors="replace")
@@ -121,11 +128,7 @@ def load_csv(url: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=60*60, show_spinner=False)
 def discover_divs_from_fixtures() -> List[str]:
-    """
-    Football-data fixtures.csv -> Div listesi
-    (Aktif ligleri otomatik yakalar)
-    """
-    fx = load_csv(FIXTURES_URL)
+    fx = parse_dates(load_csv(FIXTURES_URL))
     if "Div" not in fx.columns:
         return []
     divs = (
@@ -142,34 +145,12 @@ def discover_divs_from_fixtures() -> List[str]:
 @st.cache_data(show_spinner=False)
 def load_fixtures() -> Optional[pd.DataFrame]:
     try:
-        f = parse_dates(load_csv(FIXTURES_URL))
-        return f
+        return parse_dates(load_csv(FIXTURES_URL))
     except Exception:
         return None
 
-@st.cache_data(show_spinner=False)
-def load_multi_season_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple[pd.DataFrame, List[str]]:
-    start_year = season_start_year_for_date(anchor_date)
-    dfs = []
-    seasons_loaded = []
-    for y in range(start_year, start_year - back_seasons - 1, -1):
-        s = season_code(y)
-        url = hist_url(s, div)
-        try:
-            df = parse_dates(load_csv(url))
-            df["Season"] = s
-            dfs.append(df)
-            seasons_loaded.append(s)
-        except requests.HTTPError as e:
-            if getattr(e, "response", None) is not None and e.response.status_code == 404:
-                continue
-            raise
-
-    if not dfs:
-        raise ValueError("Bu lig/div için indirilebilir sezon bulunamadı (football-data üzerinde yok olabilir).")
-
-    d = pd.concat(dfs, ignore_index=True)
-    d = parse_dates(d)
+def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
+    d = parse_dates(df)
 
     need = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
     missing = need - set(d.columns)
@@ -181,16 +162,62 @@ def load_multi_season_history(div: str, anchor_date: dt.date, back_seasons: int 
     d["FTAG"] = pd.to_numeric(d["FTAG"], errors="coerce")
     d = d.dropna(subset=["FTHG", "FTAG"]).copy()
 
-    # anchor_date'a kadar
-    d = d[d["Date"] <= pd.Timestamp(anchor_date)].copy()
-    d = d.sort_values("Date").drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"], keep="last")
-
-    # optional numeric columns
+    # Optional numeric columns
     for col in ["HTHG", "HTAG", "HS", "AS", "HST", "AST", "HC", "AC"]:
         if col in d.columns:
             d[col] = pd.to_numeric(d[col], errors="coerce")
 
-    return d, seasons_loaded
+    d = d[d["Date"] <= pd.Timestamp(anchor_date)].copy()
+    d = d.sort_values("Date").drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"], keep="last")
+    return d
+
+@st.cache_data(show_spinner=False)
+def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple[pd.DataFrame, List[str], str]:
+    """
+    1) Main leagues: mmz4281/{season}/{div}.csv (multiple seasons)
+    2) If nothing found: /new/{div}.csv (extra leagues)
+    """
+    start_year = season_start_year_for_date(anchor_date)
+    dfs = []
+    seasons_loaded = []
+
+    # Try mmz season files first
+    for y in range(start_year, start_year - back_seasons - 1, -1):
+        s = season_code(y)
+        url = hist_url(s, div)
+        try:
+            df = load_csv(url)
+            df["Season"] = s
+            dfs.append(df)
+            seasons_loaded.append(s)
+        except requests.HTTPError as e:
+            if getattr(e, "response", None) is not None and e.response.status_code == 404:
+                continue
+            # Some other HTTP error
+            continue
+        except Exception:
+            continue
+
+    if dfs:
+        d = pd.concat(dfs, ignore_index=True)
+        d = _normalize_history(d, anchor_date)
+        return d, seasons_loaded, "mmz"
+
+    # Fallback: /new/{DIV}.csv
+    new_url = NEW_LEAGUE_URL.format(div=div)
+    try:
+        df = load_csv(new_url)
+        # Season might not exist in /new files; keep placeholder
+        df["Season"] = "NEW"
+        d = _normalize_history(df, anchor_date)
+        return d, ["NEW"], "new"
+    except Exception as e:
+        raise ValueError(
+            f"Bu lig/div için data indirilemedi. (mmz sezonda yok + new endpoint başarısız)\n"
+            f"Div: {div}\n"
+            f"Denediğim: {new_url}\n"
+            f"Hata: {e}"
+        )
 
 def find_available_odds_sets(df: pd.DataFrame) -> List[str]:
     cols = set(df.columns)
@@ -346,7 +373,7 @@ def glicko_update(r: float, rd: float, rj: float, rdj: float, s: float) -> Tuple
     d2 = 1.0 / (q * q * g * g * E * (1.0 - E) + 1e-12)
     pre = 1.0 / (1.0 / (rd * rd + 1e-12) + 1.0 / d2)
     r_new = r + q * pre * g * (s - E)
-    rd_new = math.sqrt(pre)
+    rd_new = math.sqrt(max(pre, 1e-12))
     return r_new, rd_new
 
 @st.cache_data(show_spinner=False)
@@ -398,7 +425,7 @@ def compute_ratings(df_all: pd.DataFrame, elo_k: float, elo_home_adv: float, gli
     d["GAwayRDPre"] = gl_away_rd_pre
     return d, elo, gl
 
-# form + league averages
+# Shrinkage helper
 def shrink_mean(values: np.ndarray, prior_mean: float, prior_weight: float) -> float:
     v = np.array(values, dtype=float)
     v = v[np.isfinite(v)]
@@ -407,18 +434,20 @@ def shrink_mean(values: np.ndarray, prior_mean: float, prior_weight: float) -> f
         return float(prior_mean)
     return float((v.sum() + prior_weight * prior_mean) / (n + prior_weight))
 
+# ✅ FIXED weighted averages (this is what was crashing T1 etc.)
 def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_days: int) -> Dict[str, float]:
     d = df_all.copy()
     last = pd.Timestamp(anchor_date)
-    days_ago = (last - d["Date"]).dt.days.clip(lower=0)
+
+    days_ago = (last - d["Date"]).dt.days.clip(lower=0).to_numpy()
     w = np.exp(-days_ago / float(max(10, half_life_days)))
 
     def wavg(series) -> float:
-        vals = pd.to_numeric(series, errors="coerce")
-        m = vals.notna()
+        vals = np.asarray(pd.to_numeric(series, errors="coerce"), dtype=float)
+        m = np.isfinite(vals)
         if m.sum() == 0:
             return float("nan")
-        return float(np.average(vals[m], weights=w[m.index]))
+        return float(np.average(vals[m], weights=w[m]))
 
     out = {
         "home_goals": wavg(d["FTHG"]),
@@ -428,7 +457,11 @@ def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_d
     if "HTHG" in d.columns and "HTAG" in d.columns:
         hthg = pd.to_numeric(d["HTHG"], errors="coerce")
         htag = pd.to_numeric(d["HTAG"], errors="coerce")
-        if hthg.notna().sum() > 50 and out["home_goals"] > 0 and out["away_goals"] > 0:
+        if (
+            hthg.notna().sum() > 50
+            and np.isfinite(out["home_goals"]) and np.isfinite(out["away_goals"])
+            and out["home_goals"] > 0 and out["away_goals"] > 0
+        ):
             out["ht_ratio_home"] = float(np.clip(wavg(hthg) / out["home_goals"], 0.25, 0.65))
             out["ht_ratio_away"] = float(np.clip(wavg(htag) / out["away_goals"], 0.25, 0.65))
         else:
@@ -456,7 +489,6 @@ def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_d
         out["home_xg"] = float("nan")
         out["away_xg"] = float("nan")
 
-    # RAW means (maç başı ortalama — basit)
     out["raw_home_goals"] = float(pd.to_numeric(d["FTHG"], errors="coerce").mean())
     out["raw_away_goals"] = float(pd.to_numeric(d["FTAG"], errors="coerce").mean())
     out["raw_total_goals"] = out["raw_home_goals"] + out["raw_away_goals"]
@@ -516,36 +548,38 @@ def build_team_rates_recent(
             away_used=int(len(away)),
         )
 
-        # xG proxy multipliers
-        if league.get("has_shots") and ("HS" in home.columns) and ("HST" in home.columns):
-            home_xg_for = np.array([xg_proxy(s, t2) for s, t2 in zip(home["HS"].values, home["HST"].values)], dtype=float)
-            home_xg_against = np.array([xg_proxy(s, t2) for s, t2 in zip(home["AS"].values, home["AST"].values)], dtype=float)
-            away_xg_for = np.array([xg_proxy(s, t2) for s, t2 in zip(away["AS"].values, away["AST"].values)], dtype=float)
-            away_xg_against = np.array([xg_proxy(s, t2) for s, t2 in zip(away["HS"].values, away["HST"].values)], dtype=float)
+        # xG proxy multipliers (if shots exist)
+        if league.get("has_shots"):
+            if all(c in df_all.columns for c in ["HS", "HST", "AS", "AST"]):
+                home_xg_for = np.array([xg_proxy(s, t2) for s, t2 in zip(home["HS"].values, home["HST"].values)], dtype=float)
+                home_xg_against = np.array([xg_proxy(s, t2) for s, t2 in zip(home["AS"].values, home["AST"].values)], dtype=float)
+                away_xg_for = np.array([xg_proxy(s, t2) for s, t2 in zip(away["AS"].values, away["AST"].values)], dtype=float)
+                away_xg_against = np.array([xg_proxy(s, t2) for s, t2 in zip(away["HS"].values, away["HST"].values)], dtype=float)
 
-            if np.isfinite(league["home_xg"]) and np.isfinite(league["away_xg"]) and league["home_xg"] > 0 and league["away_xg"] > 0:
-                hxg = shrink_mean(home_xg_for, league["home_xg"], prior_weight)
-                hxa = shrink_mean(home_xg_against, league["away_xg"], prior_weight)
-                axg = shrink_mean(away_xg_for, league["away_xg"], prior_weight)
-                axa = shrink_mean(away_xg_against, league["home_xg"], prior_weight)
+                if np.isfinite(league["home_xg"]) and np.isfinite(league["away_xg"]) and league["home_xg"] > 0 and league["away_xg"] > 0:
+                    hxg = shrink_mean(home_xg_for, league["home_xg"], prior_weight)
+                    hxa = shrink_mean(home_xg_against, league["away_xg"], prior_weight)
+                    axg = shrink_mean(away_xg_for, league["away_xg"], prior_weight)
+                    axa = shrink_mean(away_xg_against, league["home_xg"], prior_weight)
 
-                tr.home_xg_att = float(hxg / league["home_xg"])
-                tr.home_xg_def = float(hxa / league["away_xg"])
-                tr.away_xg_att = float(axg / league["away_xg"])
-                tr.away_xg_def = float(axa / league["home_xg"])
+                    tr.home_xg_att = float(hxg / league["home_xg"])
+                    tr.home_xg_def = float(hxa / league["away_xg"])
+                    tr.away_xg_att = float(axg / league["away_xg"])
+                    tr.away_xg_def = float(axa / league["home_xg"])
 
         # corners multipliers
-        if league.get("has_corners") and ("HC" in home.columns) and ("AC" in home.columns):
-            if np.isfinite(league["home_corners"]) and np.isfinite(league["away_corners"]) and league["home_corners"] > 0 and league["away_corners"] > 0:
-                home_cf = shrink_mean(pd.to_numeric(home["HC"], errors="coerce").values, league["home_corners"], prior_weight)
-                home_ca = shrink_mean(pd.to_numeric(home["AC"], errors="coerce").values, league["away_corners"], prior_weight)
-                away_cf = shrink_mean(pd.to_numeric(away["AC"], errors="coerce").values, league["away_corners"], prior_weight)
-                away_ca = shrink_mean(pd.to_numeric(away["HC"], errors="coerce").values, league["home_corners"], prior_weight)
+        if league.get("has_corners"):
+            if all(c in df_all.columns for c in ["HC", "AC"]):
+                if np.isfinite(league["home_corners"]) and np.isfinite(league["away_corners"]) and league["home_corners"] > 0 and league["away_corners"] > 0:
+                    home_cf = shrink_mean(pd.to_numeric(home["HC"], errors="coerce").values, league["home_corners"], prior_weight)
+                    home_ca = shrink_mean(pd.to_numeric(home["AC"], errors="coerce").values, league["away_corners"], prior_weight)
+                    away_cf = shrink_mean(pd.to_numeric(away["AC"], errors="coerce").values, league["away_corners"], prior_weight)
+                    away_ca = shrink_mean(pd.to_numeric(away["HC"], errors="coerce").values, league["home_corners"], prior_weight)
 
-                tr.home_c_att = float(home_cf / league["home_corners"])
-                tr.home_c_def = float(home_ca / league["away_corners"])
-                tr.away_c_att = float(away_cf / league["away_corners"])
-                tr.away_c_def = float(away_ca / league["home_corners"])
+                    tr.home_c_att = float(home_cf / league["home_corners"])
+                    tr.home_c_def = float(home_ca / league["away_corners"])
+                    tr.away_c_att = float(away_cf / league["away_corners"])
+                    tr.away_c_def = float(away_ca / league["home_corners"])
 
         rates[t] = tr
 
@@ -565,14 +599,14 @@ def expected_goals_from_rates(
     h = rates.get(home)
     a = rates.get(away)
     if h is None or a is None:
-        raise ValueError("Takım verisi yetersiz. min maç düşür veya back_seasons artır.")
+        raise ValueError("Takım verisi yetersiz. min maç düşür veya daha fazla sezon/maç yükle.")
 
     lam_h_goal = league["home_goals"] * h.home_attack * a.away_def
     lam_a_goal = league["away_goals"] * a.away_attack * h.home_def
 
     lam_h, lam_a = lam_h_goal, lam_a_goal
 
-    # xG blend
+    # xG blend (if available)
     if (
         xg_weight > 0
         and h.home_xg_att is not None and a.away_xg_def is not None
@@ -588,7 +622,7 @@ def expected_goals_from_rates(
     lam_h *= scale
     lam_a *= (1.0 / scale)
 
-    # manual squad factors
+    # manual squad/injury factors
     lam_h *= manual_home_factor
     lam_a *= manual_away_factor
 
@@ -651,66 +685,24 @@ def last_matches_table(df_all: pd.DataFrame, team: str, n: int = 20) -> pd.DataF
     m["Score"] = m["FTHG"].astype(int).astype(str) + "-" + m["FTAG"].astype(int).astype(str)
     return m[["Date", "Season", "HomeTeam", "AwayTeam", "Score", "GF", "GA", "WDL"]].reset_index(drop=True)
 
-def match_market_odds_from_history(df_all: pd.DataFrame, home: str, away: str, odds_cols: Tuple[str, str, str]) -> Optional[Tuple[float, float, float]]:
-    hcol, dcol, acol = odds_cols
-    m = df_all[(df_all["HomeTeam"] == home) & (df_all["AwayTeam"] == away)].dropna(subset=[hcol, dcol, acol]).copy()
-    if m.empty:
-        return None
-    row = m.sort_values("Date").iloc[-1]
-    o1, ox, o2 = safe_float(row[hcol]), safe_float(row[dcol]), safe_float(row[acol])
-    if np.isfinite(o1) and np.isfinite(ox) and np.isfinite(o2):
-        return float(o1), float(ox), float(o2)
-    return None
-
-def try_fixture_odds(fixtures_df: Optional[pd.DataFrame], div: str, home: str, away: str, odds_cols: Tuple[str, str, str]) -> Optional[Tuple[float, float, float]]:
-    if fixtures_df is None or fixtures_df.empty:
-        return None
-    hcol, dcol, acol = odds_cols
-    cols = set(fixtures_df.columns)
-    if not (hcol in cols and dcol in cols and acol in cols):
-        return None
-    f = fixtures_df.copy()
-    if "Div" in f.columns:
-        f = f[f["Div"].astype(str).str.upper() == div]
-    f = f[(f["HomeTeam"] == home) & (f["AwayTeam"] == away)].dropna(subset=[hcol, dcol, acol])
-    if f.empty:
-        return None
-    row = f.sort_values("Date").iloc[0]
-    o1, ox, o2 = safe_float(row[hcol]), safe_float(row[dcol]), safe_float(row[acol])
-    if np.isfinite(o1) and np.isfinite(ox) and np.isfinite(o2):
-        return float(o1), float(ox), float(o2)
-    return None
-
-def multinomial_calibrator_fit(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
-    clf = LogisticRegression(
-        multi_class="multinomial",
-        solver="lbfgs",
-        max_iter=1000,
-        C=1.0
-    )
-    clf.fit(X, y)
-    return clf
-
 # =========================================================
-# SIDEBAR — TEK LİSTE LİG SEÇİMİ
+# SIDEBAR — Single list leagues + auto divs
 # =========================================================
 with st.sidebar:
     st.header("Ayarlar")
 
-    # 1) fixtures.csv'den otomatik div keşfi
+    # auto divs from fixtures
     try:
         auto_divs = discover_divs_from_fixtures()
     except Exception:
         auto_divs = []
 
-    # 2) isimli ligleri + auto div'leri tek listede birleştir
     named = dict(LEAGUES)
-    existing_divs = set(v.upper() for v in named.values())
+    existing = set(v.upper() for v in named.values())
     for d in auto_divs:
-        if d not in existing_divs:
+        if d not in existing:
             named[f"[AUTO] {d}"] = d
 
-    # 3) arama kutusu
     q = st.text_input("Lig ara (isim/div)", value="")
     keys = list(named.keys())
     if q.strip():
@@ -719,18 +711,16 @@ with st.sidebar:
         if not keys:
             keys = list(named.keys())
 
-    # 4) tek dropdown
     league_key = st.selectbox("Lig (tek liste)", keys, index=0)
     div = named[league_key].strip().upper()
 
-    # 5) custom div (opsiyonel)
     with st.expander("Custom Div (isteğe bağlı)"):
         custom = st.text_input("Div code (örn: E0, SP1, T1, BRA, USA ...)", value="")
         if custom.strip():
             div = custom.strip().upper()
 
     anchor_date = st.date_input("Analiz tarihi", value=dt.date.today())
-    back_seasons = st.slider("Geriye kaç sezon indirilsin", 1, 10, 6, 1)
+    back_seasons = st.slider("Geriye kaç sezon indirilsin (mmz ligler)", 1, 10, 6, 1)
 
     st.divider()
     lookback = st.slider("Form: son kaç maç (home/away ayrı)", 10, 30, 20, 1)
@@ -754,34 +744,28 @@ with st.sidebar:
     manual_home_factor = st.slider("Home attack factor", 0.80, 1.10, 1.00, 0.01)
     manual_away_factor = st.slider("Away attack factor", 0.80, 1.10, 1.00, 0.01)
 
-    st.divider()
-    st.subheader("Market odds")
-    odds_source = st.radio("Odds kaynağı", ["Dataset (football-data)", "CSV Upload", "Manual", "None"], index=0)
-    blend_w = st.slider("Model vs Market blend (0=Model, 1=Market)", 0.0, 1.0, 0.25, 0.05)
-
 # =========================================================
 # LOAD DATA
 # =========================================================
 try:
-    df_all, seasons_loaded = load_multi_season_history(div, anchor_date, back_seasons=back_seasons)
+    df_all, seasons_loaded, source_used = load_history(div, anchor_date, back_seasons=back_seasons)
 except Exception as e:
     st.error(f"Data load error: {e}")
     st.stop()
 
 fixtures_df = load_fixtures()
-
 league = league_avgs_weighted(df_all, anchor_date, half_life_days=half_life_days)
 rates = build_team_rates_recent(df_all, league, lookback=lookback, prior_weight=prior_weight, min_matches=min_matches)
 teams = sorted(rates.keys())
 
 if len(teams) < 4:
-    st.warning("Yeterli takım verisi oluşmadı. min_matches düşür veya back_seasons artır.")
+    st.warning("Yeterli takım verisi oluşmadı. min_matches düşür veya daha fazla data yükle.")
     st.stop()
 
-df_ratings, elo_final, glicko_final = compute_ratings(df_all, elo_k=elo_k, elo_home_adv=elo_home_adv, glicko_home_adv=glicko_home_adv)
+_, elo_final, glicko_final = compute_ratings(df_all, elo_k=elo_k, elo_home_adv=elo_home_adv, glicko_home_adv=glicko_home_adv)
 
 # =========================================================
-# SHOW LEAGUE GOALS PER MATCH (sidebar + main)
+# LEAGUE GOALS PER MATCH
 # =========================================================
 weighted_home = float(league["home_goals"])
 weighted_away = float(league["away_goals"])
@@ -798,293 +782,167 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     c1.metric("Home goals", f"{weighted_home:.2f}")
     c2.metric("Away goals", f"{weighted_away:.2f}")
-    with st.expander("Raw mean (yüklenen tüm maçlar)"):
+    with st.expander("Raw mean (tüm yüklenen maçlar)"):
         st.write(f"Total goals/match: **{raw_total:.2f}**")
         st.write(f"Home: **{raw_home:.2f}** | Away: **{raw_away:.2f}**")
-        st.write(f"Maç sayısı (loaded): **{len(df_all)}**")
-        st.write(f"Seasons: **{', '.join(seasons_loaded[:8])}{'...' if len(seasons_loaded)>8 else ''}**")
+        st.write(f"Maç sayısı: **{len(df_all)}**")
+        st.write(f"Kaynak: **{source_used}** | Seasons: **{', '.join(seasons_loaded[:8])}{'...' if len(seasons_loaded)>8 else ''}**")
 
-st.info(f"**Lig ({div}) — Maç başına gol ortalaması (Total): {weighted_total:.2f}**  | Home {weighted_home:.2f} / Away {weighted_away:.2f}")
-
-# =========================================================
-# TABS
-# =========================================================
-tabs = st.tabs(["🎯 Match Analyzer", "🧩 Data & Odds"])
+st.info(
+    f"**Lig ({div}) — Maç başına gol ortalaması (Total): {weighted_total:.2f}**  | "
+    f"Home {weighted_home:.2f} / Away {weighted_away:.2f}  |  Source: {source_used}"
+)
 
 # =========================================================
-# TAB: MATCH ANALYZER
+# MATCH ANALYZER
 # =========================================================
-with tabs[0]:
-    st.subheader("Maç Analizi")
+st.subheader("🎯 Match Analyzer")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        home_team = st.selectbox("Home", teams, index=0)
-    with col2:
-        away_team = st.selectbox("Away", teams, index=min(1, len(teams) - 1))
+col1, col2 = st.columns(2)
+with col1:
+    home_team = st.selectbox("Home", teams, index=0)
+with col2:
+    away_team = st.selectbox("Away", teams, index=min(1, len(teams) - 1))
 
-    if home_team == away_team:
-        st.warning("Home ve Away aynı olamaz.")
-        st.stop()
+if home_team == away_team:
+    st.warning("Home ve Away aynı olamaz.")
+    st.stop()
 
-    elo_home = float(elo_final.get(home_team, 1500.0))
-    elo_away = float(elo_final.get(away_team, 1500.0))
-    g_home = float(glicko_final.get(home_team, (1500.0, 350.0))[0])
-    g_away = float(glicko_final.get(away_team, (1500.0, 350.0))[0])
+elo_home = float(elo_final.get(home_team, 1500.0))
+elo_away = float(elo_final.get(away_team, 1500.0))
+g_home = float(glicko_final.get(home_team, (1500.0, 350.0))[0])
+g_away = float(glicko_final.get(away_team, (1500.0, 350.0))[0])
 
-    elo_diff = (elo_home + elo_home_adv) - elo_away
-    g_diff = (g_home + glicko_home_adv) - g_away
+elo_diff = (elo_home + elo_home_adv) - elo_away
+g_diff = (g_home + glicko_home_adv) - g_away
 
-    lam_h, lam_a = expected_goals_from_rates(
-        rates, league,
-        home=home_team, away=away_team,
-        xg_weight=xg_weight,
-        elo_diff=elo_diff,
-        elo_to_goal_k=elo_to_goal_k,
-        manual_home_factor=manual_home_factor,
-        manual_away_factor=manual_away_factor,
-    )
+lam_h, lam_a = expected_goals_from_rates(
+    rates, league,
+    home=home_team, away=away_team,
+    xg_weight=xg_weight,
+    elo_diff=elo_diff,
+    elo_to_goal_k=elo_to_goal_k,
+    manual_home_factor=manual_home_factor,
+    manual_away_factor=manual_away_factor,
+)
 
-    mat = score_matrix(lam_h, lam_a, max_goals=max_goals)
-    pH, pD, pA = outcome_probs_from_mat(mat)
+mat = score_matrix(lam_h, lam_a, max_goals=max_goals)
+pH, pD, pA = outcome_probs_from_mat(mat)
 
-    ht_ratio_home = league.get("ht_ratio_home", 0.45)
-    ht_ratio_away = league.get("ht_ratio_away", 0.45)
-    mat_ht = score_matrix(max(0.01, lam_h * ht_ratio_home), max(0.01, lam_a * ht_ratio_away), max_goals=max_goals)
-    pH_ht, pD_ht, pA_ht = outcome_probs_from_mat(mat_ht)
+ht_ratio_home = league.get("ht_ratio_home", 0.45)
+ht_ratio_away = league.get("ht_ratio_away", 0.45)
+mat_ht = score_matrix(max(0.01, lam_h * ht_ratio_home), max(0.01, lam_a * ht_ratio_away), max_goals=max_goals)
+pH_ht, pD_ht, pA_ht = outcome_probs_from_mat(mat_ht)
 
-    p_over15 = prob_over_from_mat(mat, 1.5)
-    p_over25 = prob_over_from_mat(mat, 2.5)
-    p_over35 = prob_over_from_mat(mat, 3.5)
-    p_btts = prob_btts_from_mat(mat)
-    p_combo = prob_combo_btts_over25(mat)
+p_over15 = prob_over_from_mat(mat, 1.5)
+p_over25 = prob_over_from_mat(mat, 2.5)
+p_over35 = prob_over_from_mat(mat, 3.5)
+p_btts = prob_btts_from_mat(mat)
+p_combo = prob_combo_btts_over25(mat)
 
-    p_h_over05 = prob_team_over(mat, "H", 0.5)
-    p_h_over15 = prob_team_over(mat, "H", 1.5)
-    p_a_over05 = prob_team_over(mat, "A", 0.5)
-    p_a_over15 = prob_team_over(mat, "A", 1.5)
+p_h_over05 = prob_team_over(mat, "H", 0.5)
+p_h_over15 = prob_team_over(mat, "H", 1.5)
+p_a_over05 = prob_team_over(mat, "A", 0.5)
+p_a_over15 = prob_team_over(mat, "A", 1.5)
 
-    ah_lines = [-0.5, +0.5, -1.5, +1.5]
-    ah_home = {line: prob_handicap_home(mat, line) for line in ah_lines}
-    ah_away = {line: prob_handicap_away(mat, line) for line in ah_lines}
+ah_lines = [-0.5, +0.5, -1.5, +1.5]
+ah_home = {line: prob_handicap_home(mat, line) for line in ah_lines}
+ah_away = {line: prob_handicap_away(mat, line) for line in ah_lines}
 
-    p_h_wtn = prob_win_to_nil(mat, "H")
-    p_a_wtn = prob_win_to_nil(mat, "A")
+p_h_wtn = prob_win_to_nil(mat, "H")
+p_a_wtn = prob_win_to_nil(mat, "A")
 
-    htft = htft_probs(lam_h, lam_a, ht_ratio_home, ht_ratio_away, max_goals=max_goals)
+htft = htft_probs(lam_h, lam_a, ht_ratio_home, ht_ratio_away, max_goals=max_goals)
 
-    corners = expected_corners_from_rates(rates, league, home_team, away_team)
-    if corners is not None:
-        lam_hc, lam_ac = corners
-        mat_c = score_matrix(lam_hc, lam_ac, max_goals=12)
-        p_hc_over45 = prob_team_over(mat_c, "H", 4.5)
-        p_ac_over35 = prob_team_over(mat_c, "A", 3.5)
-        c_home_m15 = prob_handicap_home(mat_c, -1.5)
-        c_away_m15 = prob_handicap_away(mat_c, -1.5)
-        c_over95 = prob_over_from_mat(mat_c, 9.5)
-        c_over105 = prob_over_from_mat(mat_c, 10.5)
+corners = expected_corners_from_rates(rates, league, home_team, away_team)
+if corners is not None:
+    lam_hc, lam_ac = corners
+    mat_c = score_matrix(lam_hc, lam_ac, max_goals=12)
+    c_over95 = prob_over_from_mat(mat_c, 9.5)
+    c_over105 = prob_over_from_mat(mat_c, 10.5)
+else:
+    lam_hc = lam_ac = None
+
+with st.expander("📌 Son 20 maç (form)"):
+    l, r = st.columns(2)
+    with l:
+        st.markdown(f"**{home_team}**")
+        st.dataframe(last_matches_table(df_all, home_team, n=20), use_container_width=True, height=320)
+    with r:
+        st.markdown(f"**{away_team}**")
+        st.dataframe(last_matches_table(df_all, away_team, n=20), use_container_width=True, height=320)
+
+A, B, C = st.columns([1.15, 1.05, 1.25], vertical_alignment="top")
+
+with A:
+    st.markdown("### 1X2 (FT)")
+    st.write(f"**H {pH*100:.1f}% | D {pD*100:.1f}% | A {pA*100:.1f}%**")
+    st.caption(f"Expected goals: {lam_h:.2f} - {lam_a:.2f}")
+    st.caption(f"ELO diff: {elo_diff:+.0f} | Glicko diff: {g_diff:+.0f}")
+
+    st.markdown("### Over/Under")
+    st.write(f"Over 1.5: **{p_over15*100:.1f}%** (Fair {1/p_over15:.2f})")
+    st.write(f"Over 2.5: **{p_over25*100:.1f}%** (Fair {1/p_over25:.2f})")
+    st.write(f"Over 3.5: **{p_over35*100:.1f}%** (Fair {1/p_over35:.2f})")
+
+    st.markdown("### BTTS + Kombolar")
+    st.write(f"BTTS (KG Var): **{p_btts*100:.1f}%** (Fair {1/p_btts:.2f})")
+    st.write(f"BTTS & Over 2.5: **{p_combo*100:.1f}%** (Fair {1/p_combo:.2f})")
+
+    st.markdown("### Team totals")
+    st.write(f"Home over 0.5: **{p_h_over05*100:.1f}%** | Home over 1.5: **{p_h_over15*100:.1f}%**")
+    st.write(f"Away over 0.5: **{p_a_over05*100:.1f}%** | Away over 1.5: **{p_a_over15*100:.1f}%**")
+
+    st.markdown("### Win to Nil")
+    st.write(f"Home win to nil: **{p_h_wtn*100:.1f}%**")
+    st.write(f"Away win to nil: **{p_a_wtn*100:.1f}%**")
+
+with B:
+    st.markdown("### İlk Yarı")
+    st.write(f"İY 1X2: **H {pH_ht*100:.1f}% | D {pD_ht*100:.1f}% | A {pA_ht*100:.1f}%**")
+    st.write(f"İY Over 0.5: **{prob_over_from_mat(mat_ht, 0.5)*100:.1f}%**")
+    st.write(f"İY Over 1.5: **{prob_over_from_mat(mat_ht, 1.5)*100:.1f}%**")
+
+    st.markdown("### İY / MS (HT/FT)")
+    htft_df = pd.DataFrame({"HT/FT": list(htft.keys()), "Prob": list(htft.values())}).sort_values("Prob", ascending=False)
+    htft_df = htft_df.head(9).copy()
+    htft_df["FairOdds"] = htft_df["Prob"].apply(lambda p: (1/p) if p > 0 else np.nan)
+    st.dataframe(htft_df, use_container_width=True, height=320)
+
+    st.markdown("### Asian Handicap")
+    ah_tbl = []
+    for line in ah_lines:
+        ah_tbl.append(("Home", line, ah_home[line], (1/ah_home[line] if ah_home[line] > 0 else np.nan)))
+    for line in ah_lines:
+        ah_tbl.append(("Away", line, ah_away[line], (1/ah_away[line] if ah_away[line] > 0 else np.nan)))
+    ahdf = pd.DataFrame(ah_tbl, columns=["Side", "Line", "Prob", "FairOdds"])
+    ahdf["Prob"] = (ahdf["Prob"] * 100).round(2)
+    ahdf["FairOdds"] = ahdf["FairOdds"].round(2)
+    st.dataframe(ahdf, use_container_width=True, height=260)
+
+with C:
+    st.markdown("### Doğru skor & Total goals")
+    st.dataframe(top_scores(mat, topn=10), use_container_width=True, height=300)
+    st.dataframe(exact_total_goals_probs(mat, max_total=6), use_container_width=True, height=260)
+
+    st.markdown("### Korner (varsa)")
+    if lam_hc is None:
+        st.info("Bu lig datasında korner kolonları yok (HC/AC). (Extra liglerde genelde yok.)")
     else:
-        lam_hc = lam_ac = None
+        st.write(f"Expected corners: **{lam_hc:.2f} - {lam_ac:.2f}** (Total {lam_hc+lam_ac:.2f})")
+        st.write(f"Total corners Over 9.5: **{c_over95*100:.1f}%** (Fair {1/c_over95:.2f})")
+        st.write(f"Total corners Over 10.5: **{c_over105*100:.1f}%** (Fair {1/c_over105:.2f})")
 
-    # MARKET ODDS 1X2
-    market_odds = None
-    p_mkt = None
-    chosen_set = None
+st.divider()
+st.subheader("🧩 Diagnostics")
+st.write(f"Div: **{div}** | Source: **{source_used}** | Matches loaded: **{len(df_all)}**")
+st.write(f"Seasons: **{', '.join(seasons_loaded[:8])}{'...' if len(seasons_loaded)>8 else ''}**")
 
-    if odds_source == "Dataset (football-data)":
-        avail_sets = find_available_odds_sets(df_all)
-        if avail_sets:
-            chosen_set = st.selectbox("Odds set", avail_sets, index=0)
-            cols = get_odds_cols(chosen_set)
-            market_odds = try_fixture_odds(fixtures_df, div, home_team, away_team, cols) if cols else None
-            if market_odds is None and cols:
-                market_odds = match_market_odds_from_history(df_all, home_team, away_team, cols)
-            if market_odds is not None:
-                p_mkt = np.array(implied_probs_1x2(*market_odds), dtype=float)
-        else:
-            st.info("Bu lig dosyasında odds kolonları yok. (CSV Upload / Manual deneyebilirsin.)")
-
-    elif odds_source == "CSV Upload":
-        st.caption("CSV format: Date,Div,HomeTeam,AwayTeam,H,D,A")
-        up = st.file_uploader("Odds CSV yükle", type=["csv"])
-        if up is not None:
-            try:
-                mdf = pd.read_csv(up)
-                if "Date" in mdf.columns:
-                    mdf["Date"] = pd.to_datetime(mdf["Date"], dayfirst=True, errors="coerce")
-                for c in ["H", "D", "A"]:
-                    mdf[c] = pd.to_numeric(mdf[c], errors="coerce")
-                tmp = mdf.copy()
-                if "Div" in tmp.columns:
-                    tmp = tmp[tmp["Div"].astype(str).str.upper() == div]
-                tmp = tmp[(tmp["HomeTeam"] == home_team) & (tmp["AwayTeam"] == away_team)].dropna(subset=["H", "D", "A"])
-                if not tmp.empty:
-                    row = tmp.sort_values("Date").iloc[-1]
-                    market_odds = (float(row["H"]), float(row["D"]), float(row["A"]))
-                    p_mkt = np.array(implied_probs_1x2(*market_odds), dtype=float)
-            except Exception as e:
-                st.error(f"CSV okunamadı: {e}")
-
-    elif odds_source == "Manual":
-        o1 = st.number_input("Home odds", min_value=1.01, value=2.10, step=0.01)
-        ox = st.number_input("Draw odds", min_value=1.01, value=3.20, step=0.01)
-        o2 = st.number_input("Away odds", min_value=1.01, value=3.50, step=0.01)
-        market_odds = (float(o1), float(ox), float(o2))
-        p_mkt = np.array(implied_probs_1x2(*market_odds), dtype=float)
-
-    p_model = np.array([pH, pD, pA], dtype=float)
-    if p_mkt is not None and np.all(np.isfinite(p_mkt)):
-        p_blend = (1 - blend_w) * p_model + blend_w * p_mkt
-        p_blend = p_blend / p_blend.sum()
-    else:
-        p_blend = p_model
-
-    with st.expander("📌 Son 20 maç (form)"):
-        l, r = st.columns(2)
-        with l:
-            st.markdown(f"**{home_team}**")
-            st.dataframe(last_matches_table(df_all, home_team, n=20), use_container_width=True, height=320)
-        with r:
-            st.markdown(f"**{away_team}**")
-            st.dataframe(last_matches_table(df_all, away_team, n=20), use_container_width=True, height=320)
-
-    A, B, C = st.columns([1.15, 1.05, 1.25], vertical_alignment="top")
-
-    with A:
-        st.markdown("### 1X2 (FT)")
-        st.write(f"Model: **H {p_model[0]*100:.1f}% | D {p_model[1]*100:.1f}% | A {p_model[2]*100:.1f}%**")
-        st.write(f"Blend: **H {p_blend[0]*100:.1f}% | D {p_blend[1]*100:.1f}% | A {p_blend[2]*100:.1f}%**")
-        st.caption(f"Expected goals: {lam_h:.2f} - {lam_a:.2f}")
-        st.caption(f"ELO diff: {elo_diff:+.0f} | Glicko diff: {g_diff:+.0f}")
-
-        st.markdown("### Over/Under")
-        st.write(f"Over 1.5: **{p_over15*100:.1f}%** (Fair {1/p_over15:.2f})")
-        st.write(f"Over 2.5: **{p_over25*100:.1f}%** (Fair {1/p_over25:.2f})")
-        st.write(f"Over 3.5: **{p_over35*100:.1f}%** (Fair {1/p_over35:.2f})")
-
-        st.markdown("### BTTS + Kombolar")
-        st.write(f"BTTS (KG Var): **{p_btts*100:.1f}%** (Fair {1/p_btts:.2f})")
-        st.write(f"BTTS & Over 2.5: **{p_combo*100:.1f}%** (Fair {1/p_combo:.2f})")
-
-        st.markdown("### Team totals")
-        st.write(f"Home over 0.5: **{p_h_over05*100:.1f}%** | Home over 1.5: **{p_h_over15*100:.1f}%**")
-        st.write(f"Away over 0.5: **{p_a_over05*100:.1f}%** | Away over 1.5: **{p_a_over15*100:.1f}%**")
-
-        st.markdown("### Win to Nil")
-        st.write(f"Home win to nil: **{p_h_wtn*100:.1f}%**")
-        st.write(f"Away win to nil: **{p_a_wtn*100:.1f}%**")
-
-    with B:
-        st.markdown("### İlk Yarı")
-        st.write(f"İY 1X2: **H {pH_ht*100:.1f}% | D {pD_ht*100:.1f}% | A {pA_ht*100:.1f}%**")
-        st.write(f"İY Over 0.5: **{prob_over_from_mat(mat_ht, 0.5)*100:.1f}%**")
-        st.write(f"İY Over 1.5: **{prob_over_from_mat(mat_ht, 1.5)*100:.1f}%**")
-
-        st.markdown("### İY / MS (HT/FT)")
-        htft_df = pd.DataFrame({"HT/FT": list(htft.keys()), "Prob": list(htft.values())}).sort_values("Prob", ascending=False)
-        htft_df = htft_df.head(9).copy()
-        htft_df["FairOdds"] = htft_df["Prob"].apply(lambda p: (1/p) if p > 0 else np.nan)
-        st.dataframe(htft_df, use_container_width=True, height=320)
-
-        st.markdown("### Asian Handicap")
-        ah_tbl = []
-        for line in ah_lines:
-            ah_tbl.append(("Home", line, ah_home[line], (1/ah_home[line] if ah_home[line] > 0 else np.nan)))
-        for line in ah_lines:
-            ah_tbl.append(("Away", line, ah_away[line], (1/ah_away[line] if ah_away[line] > 0 else np.nan)))
-        ahdf = pd.DataFrame(ah_tbl, columns=["Side", "Line", "Prob", "FairOdds"])
-        ahdf["Prob"] = (ahdf["Prob"] * 100).round(2)
-        ahdf["FairOdds"] = ahdf["FairOdds"].round(2)
-        st.dataframe(ahdf, use_container_width=True, height=260)
-
-    with C:
-        st.markdown("### Doğru skor & Total goals")
-        st.dataframe(top_scores(mat, topn=10), use_container_width=True, height=300)
-        st.dataframe(exact_total_goals_probs(mat, max_total=6), use_container_width=True, height=260)
-
-        st.markdown("### Market Odds → Edge / EV (1X2)")
-        if market_odds is None or p_mkt is None or not np.all(np.isfinite(p_mkt)):
-            st.info("Odds bağlı değil. Soldan Odds kaynağı seç.")
-        else:
-            st.write(f"Odds set: **{chosen_set or odds_source}**")
-            st.write(f"Odds: **{market_odds[0]:.2f} / {market_odds[1]:.2f} / {market_odds[2]:.2f}**")
-            st.write(f"Market prob (vig removed): **{p_mkt[0]*100:.1f}% / {p_mkt[1]*100:.1f}% / {p_mkt[2]*100:.1f}%**")
-
-            edge = p_blend - p_mkt
-            ev = p_blend * np.array(market_odds) - 1.0
-
-            out = pd.DataFrame({
-                "Outcome": ["Home", "Draw", "Away"],
-                "P_blend": p_blend,
-                "P_market": p_mkt,
-                "Edge": edge,
-                "Odds": market_odds,
-                "EV(p*odds-1)": ev,
-                "FairOdds(blend)": 1.0 / np.clip(p_blend, 1e-12, 1.0),
-            })
-            out["P_blend"] = (out["P_blend"] * 100).round(2)
-            out["P_market"] = (out["P_market"] * 100).round(2)
-            out["Edge"] = (out["Edge"] * 100).round(2)
-            out["EV(p*odds-1)"] = out["EV(p*odds-1)"].round(3)
-            out["FairOdds(blend)"] = out["FairOdds(blend)"].round(2)
-            st.dataframe(out, use_container_width=True, height=240)
-
-        st.markdown("### Korner (varsa)")
-        if lam_hc is None:
-            st.info("Bu lig datasında korner kolonları yok (HC/AC).")
-        else:
-            st.write(f"Expected corners: **{lam_hc:.2f} - {lam_ac:.2f}** (Total {lam_hc+lam_ac:.2f})")
-            st.write(f"Total corners Over 9.5: **{c_over95*100:.1f}%** (Fair {1/c_over95:.2f})")
-            st.write(f"Total corners Over 10.5: **{c_over105*100:.1f}%** (Fair {1/c_over105:.2f})")
-            st.write(f"Home corners over 4.5: **{p_hc_over45*100:.1f}%**")
-            st.write(f"Away corners over 3.5: **{p_ac_over35*100:.1f}%**")
-            st.write(f"Corners Hcap Home -1.5 (P): **{c_home_m15*100:.1f}%**")
-            st.write(f"Corners Hcap Away -1.5 (P): **{c_away_m15*100:.1f}%**")
-
-# =========================================================
-# TAB: DATA & ODDS
-# =========================================================
-with tabs[1]:
-    st.subheader("Data & Odds Diagnoser")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Div", div)
-    c2.metric("Seasons loaded", str(len(seasons_loaded)))
-    c3.metric("Has corners", "Yes" if league.get("has_corners") else "No")
-    c4.metric("Has shots", "Yes" if league.get("has_shots") else "No")
-
-    st.write(f"Loaded seasons: **{', '.join(seasons_loaded[:8])}{'...' if len(seasons_loaded) > 8 else ''}**")
-    st.write(f"Maç sayısı: **{len(df_all)}**")
-
-    st.markdown("### Lig gol ortalaması (maç başı)")
-    st.write(f"Recent-weighted: Home **{weighted_home:.2f}** | Away **{weighted_away:.2f}** | Total **{weighted_total:.2f}**")
-    st.write(f"Raw mean: Home **{raw_home:.2f}** | Away **{raw_away:.2f}** | Total **{raw_total:.2f}**")
-
-    st.divider()
-    st.markdown("### Mevcut 1X2 odds setleri (dataset)")
-    avail = find_available_odds_sets(df_all)
-    if avail:
-        st.success("Bulunan odds setleri: " + ", ".join(avail))
-    else:
-        st.info("Bu lig datasında odds kolonları yok.")
-
-    st.divider()
-    st.markdown("### Fixtures (yaklaşan maçlar) (opsiyonel)")
-    if fixtures_df is None or fixtures_df.empty:
-        st.info("fixtures.csv çekilemedi.")
-    else:
+if fixtures_df is not None and not fixtures_df.empty:
+    with st.expander("Upcoming fixtures (opsiyonel)"):
         f = fixtures_df.copy()
         if "Div" in f.columns:
             f = f[f["Div"].astype(str).str.upper() == div]
         f = f.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).sort_values("Date")
         f = f[f["Date"] >= pd.Timestamp(anchor_date)]
         st.dataframe(f.head(25), use_container_width=True, height=420)
-
-    st.divider()
-    st.markdown("### Odds CSV Template (manuel bağlamak için)")
-    st.code(
-        "Date,Div,HomeTeam,AwayTeam,H,D,A\n"
-        "2026-02-28,T1,TeamA,TeamB,2.10,3.20,3.50\n",
-        language="text"
-    )
-    st.caption("Team isimleri dataset ile birebir eşleşmeli.")
