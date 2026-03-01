@@ -25,12 +25,12 @@ FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 NEW_LEAGUE_URL = "https://www.football-data.co.uk/new/{div}.csv"  # Extra leagues often here
 
 # =========================================================
-# LEAGUE LIST (Manually named + auto-discovery from fixtures)
+# LEAGUE LIST (Main + Extra — single list)
 # =========================================================
 LEAGUES = {
-    # Turkey
-    "Turkey - Süper Lig (T1)": "T1",
-
+    # -------------------------
+    # MAIN LEAGUES (11 countries / 22 divisions)
+    # -------------------------
     # England
     "England - Premier League (E0)": "E0",
     "England - Championship (E1)": "E1",
@@ -44,27 +44,48 @@ LEAGUES = {
     "Scotland - League One (SC2)": "SC2",
     "Scotland - League Two (SC3)": "SC3",
 
-    # Spain / Italy / Germany / France
-    "Spain - La Liga (SP1)": "SP1",
-    "Spain - Segunda (SP2)": "SP2",
-    "Italy - Serie A (I1)": "I1",
-    "Italy - Serie B (I2)": "I2",
+    # Germany
     "Germany - Bundesliga (D1)": "D1",
     "Germany - 2. Bundesliga (D2)": "D2",
+
+    # Italy
+    "Italy - Serie A (I1)": "I1",
+    "Italy - Serie B (I2)": "I2",
+
+    # Spain
+    "Spain - La Liga (SP1)": "SP1",
+    "Spain - Segunda (SP2)": "SP2",
+
+    # France
     "France - Ligue 1 (F1)": "F1",
     "France - Ligue 2 (F2)": "F2",
 
-    # Netherlands / Belgium / Portugal / Greece
+    # Netherlands / Belgium / Portugal / Turkey / Greece
     "Netherlands - Eredivisie (N1)": "N1",
     "Belgium - Jupiler Pro (B1)": "B1",
     "Portugal - Primeira Liga (P1)": "P1",
+    "Turkey - Süper Lig (T1)": "T1",
     "Greece - Super League (G1)": "G1",
 
-    # Extra leagues (football-data 'Extra Leagues')
-    "USA - MLS (USA)": "USA",
+    # -------------------------
+    # EXTRA LEAGUES (16 worldwide premier divisions) -> /new/{DIV}.csv
+    # -------------------------
     "Argentina - Primera División (ARG)": "ARG",
+    "Austria - Bundesliga (AUT)": "AUT",
     "Brazil - Serie A (BRA)": "BRA",
+    "China - Super League (CHN)": "CHN",
+    "Denmark - Superliga (DNK)": "DNK",
+    "Finland - Veikkausliiga (FIN)": "FIN",
+    "Ireland - Premier Division (IRL)": "IRL",
+    "Japan - J-League (JPN)": "JPN",
     "Mexico - Liga MX (MEX)": "MEX",
+    "Norway - Eliteserien (NOR)": "NOR",
+    "Poland - Ekstraklasa (POL)": "POL",
+    "Romania - Liga 1 (ROU)": "ROU",  # dikkat: ROM değil ROU
+    "Russia - Premier League (RUS)": "RUS",
+    "Sweden - Allsvenskan (SWE)": "SWE",
+    "Switzerland - Super League (SWZ)": "SWZ",
+    "USA - MLS (USA)": "USA",
 }
 
 # football-data odds setleri (1X2)
@@ -95,6 +116,7 @@ def hist_url(season: str, div: str) -> str:
 
 def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     return df
@@ -114,7 +136,6 @@ def safe_float(x):
 
 @st.cache_data(show_spinner=False)
 def load_csv(url: str) -> pd.DataFrame:
-    # Slightly more robust headers (some endpoints are picky)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)",
         "Accept": "text/csv,text/plain,*/*",
@@ -150,12 +171,49 @@ def load_fixtures() -> Optional[pd.DataFrame]:
         return None
 
 def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
-    d = parse_dates(df)
+    """
+    Supports BOTH schemas:
+    - mmz: Date, HomeTeam, AwayTeam, FTHG, FTAG
+    - new/worldwide: Date, Home, Away, HG, AG (or similar)
+    """
+    d = df.copy()
+    d.columns = [str(c).replace("\ufeff", "").strip() for c in d.columns]
+    d = parse_dates(d)
 
-    need = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
-    missing = need - set(d.columns)
-    if missing:
-        raise ValueError(f"Zorunlu kolonlar eksik: {sorted(list(missing))}")
+    # Case-insensitive resolver
+    lower_map = {str(c).strip().lower(): c for c in d.columns}
+
+    def pick(*cands: str) -> Optional[str]:
+        for c in cands:
+            key = c.strip().lower()
+            if key in lower_map:
+                return lower_map[key]
+        return None
+
+    col_date = pick("Date", "MatchDate", "Match Date")
+    col_home = pick("HomeTeam", "Home Team", "Home")
+    col_away = pick("AwayTeam", "Away Team", "Away")
+    col_fthg = pick("FTHG", "HG", "HomeGoals", "Home Goals", "FTHome")
+    col_ftag = pick("FTAG", "AG", "AwayGoals", "Away Goals", "FTAway")
+
+    if not col_date:
+        raise ValueError("Zorunlu kolon eksik: Date")
+    if not col_home:
+        raise ValueError("Zorunlu kolon eksik: HomeTeam/Home")
+    if not col_away:
+        raise ValueError("Zorunlu kolon eksik: AwayTeam/Away")
+    if not col_fthg:
+        raise ValueError("Zorunlu kolon eksik: FTHG/HG")
+    if not col_ftag:
+        raise ValueError("Zorunlu kolon eksik: FTAG/AG")
+
+    d = d.rename(columns={
+        col_date: "Date",
+        col_home: "HomeTeam",
+        col_away: "AwayTeam",
+        col_fthg: "FTHG",
+        col_ftag: "FTAG",
+    })
 
     d = d.dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
     d["FTHG"] = pd.to_numeric(d["FTHG"], errors="coerce")
@@ -168,7 +226,10 @@ def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
             d[col] = pd.to_numeric(d[col], errors="coerce")
 
     d = d[d["Date"] <= pd.Timestamp(anchor_date)].copy()
-    d = d.sort_values("Date").drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"], keep="last")
+    d = d.sort_values("Date").drop_duplicates(
+        subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"],
+        keep="last"
+    )
     return d
 
 @st.cache_data(show_spinner=False)
@@ -193,7 +254,6 @@ def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple
         except requests.HTTPError as e:
             if getattr(e, "response", None) is not None and e.response.status_code == 404:
                 continue
-            # Some other HTTP error
             continue
         except Exception:
             continue
@@ -207,7 +267,6 @@ def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple
     new_url = NEW_LEAGUE_URL.format(div=div)
     try:
         df = load_csv(new_url)
-        # Season might not exist in /new files; keep placeholder
         df["Season"] = "NEW"
         d = _normalize_history(df, anchor_date)
         return d, ["NEW"], "new"
@@ -434,7 +493,7 @@ def shrink_mean(values: np.ndarray, prior_mean: float, prior_weight: float) -> f
         return float(prior_mean)
     return float((v.sum() + prior_weight * prior_mean) / (n + prior_weight))
 
-# ✅ FIXED weighted averages (this is what was crashing T1 etc.)
+# ✅ FIXED weighted averages
 def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_days: int) -> Dict[str, float]:
     d = df_all.copy()
     last = pd.Timestamp(anchor_date)
