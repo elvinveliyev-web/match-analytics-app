@@ -25,12 +25,12 @@ FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 NEW_LEAGUE_URL = "https://www.football-data.co.uk/new/{div}.csv"  # Extra leagues often here
 
 # =========================================================
-# LEAGUE LIST (Main + Extra — single list)
+# LEAGUE LIST (Manually named + auto-discovery from fixtures)
 # =========================================================
 LEAGUES = {
-    # -------------------------
-    # MAIN LEAGUES (11 countries / 22 divisions)
-    # -------------------------
+    # Turkey
+    "Turkey - Süper Lig (T1)": "T1",
+
     # England
     "England - Premier League (E0)": "E0",
     "England - Championship (E1)": "E1",
@@ -44,49 +44,45 @@ LEAGUES = {
     "Scotland - League One (SC2)": "SC2",
     "Scotland - League Two (SC3)": "SC3",
 
-    # Germany
-    "Germany - Bundesliga (D1)": "D1",
-    "Germany - 2. Bundesliga (D2)": "D2",
-
-    # Italy
-    "Italy - Serie A (I1)": "I1",
-    "Italy - Serie B (I2)": "I2",
-
-    # Spain
+    # Spain / Italy / Germany / France
     "Spain - La Liga (SP1)": "SP1",
     "Spain - Segunda (SP2)": "SP2",
-
-    # France
+    "Italy - Serie A (I1)": "I1",
+    "Italy - Serie B (I2)": "I2",
+    "Germany - Bundesliga (D1)": "D1",
+    "Germany - 2. Bundesliga (D2)": "D2",
     "France - Ligue 1 (F1)": "F1",
     "France - Ligue 2 (F2)": "F2",
 
-    # Netherlands / Belgium / Portugal / Turkey / Greece
+    # Netherlands / Belgium / Portugal / Greece
     "Netherlands - Eredivisie (N1)": "N1",
     "Belgium - Jupiler Pro (B1)": "B1",
     "Portugal - Primeira Liga (P1)": "P1",
-    "Turkey - Süper Lig (T1)": "T1",
     "Greece - Super League (G1)": "G1",
 
-    # -------------------------
-    # EXTRA LEAGUES (16 worldwide premier divisions) -> /new/{DIV}.csv
-    # -------------------------
+    # Extra leagues (football-data 'All new countries' /new/{div}.csv)
+    "USA - MLS (USA)": "USA",
     "Argentina - Primera División (ARG)": "ARG",
-    "Austria - Bundesliga (AUT)": "AUT",
     "Brazil - Serie A (BRA)": "BRA",
+    "Mexico - Liga MX (MEX)": "MEX",
+}
+
+# ✅ ADD: football-data "Extra Leagues" full set (16)
+# Not: Romania kodu ROM değil ROU
+LEAGUES.update({
+    "Austria - Bundesliga (AUT)": "AUT",
     "China - Super League (CHN)": "CHN",
     "Denmark - Superliga (DNK)": "DNK",
     "Finland - Veikkausliiga (FIN)": "FIN",
     "Ireland - Premier Division (IRL)": "IRL",
     "Japan - J-League (JPN)": "JPN",
-    "Mexico - Liga MX (MEX)": "MEX",
     "Norway - Eliteserien (NOR)": "NOR",
     "Poland - Ekstraklasa (POL)": "POL",
-    "Romania - Liga 1 (ROU)": "ROU",  # dikkat: ROM değil ROU
+    "Romania - Liga 1 (ROU)": "ROU",
     "Russia - Premier League (RUS)": "RUS",
     "Sweden - Allsvenskan (SWE)": "SWE",
     "Switzerland - Super League (SWZ)": "SWZ",
-    "USA - MLS (USA)": "USA",
-}
+})
 
 # football-data odds setleri (1X2)
 ODDS_SETS = [
@@ -116,7 +112,6 @@ def hist_url(season: str, div: str) -> str:
 
 def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     return df
@@ -136,6 +131,7 @@ def safe_float(x):
 
 @st.cache_data(show_spinner=False)
 def load_csv(url: str) -> pd.DataFrame:
+    # Slightly more robust headers (some endpoints are picky)
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)",
         "Accept": "text/csv,text/plain,*/*",
@@ -171,16 +167,34 @@ def load_fixtures() -> Optional[pd.DataFrame]:
         return None
 
 def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
-    """
-    Supports BOTH schemas:
-    - mmz: Date, HomeTeam, AwayTeam, FTHG, FTAG
-    - new/worldwide: Date, Home, Away, HG, AG (or similar)
-    """
+    d = parse_dates(df)
+
+    need = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
+    missing = need - set(d.columns)
+    if missing:
+        raise ValueError(f"Zorunlu kolonlar eksik: {sorted(list(missing))}")
+
+    d = d.dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
+    d["FTHG"] = pd.to_numeric(d["FTHG"], errors="coerce")
+    d["FTAG"] = pd.to_numeric(d["FTAG"], errors="coerce")
+    d = d.dropna(subset=["FTHG", "FTAG"]).copy()
+
+    # Optional numeric columns
+    for col in ["HTHG", "HTAG", "HS", "AS", "HST", "AST", "HC", "AC"]:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+
+    d = d[d["Date"] <= pd.Timestamp(anchor_date)].copy()
+    d = d.sort_values("Date").drop_duplicates(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"], keep="last")
+    return d
+
+# ✅ PATCH: Extra liglerde (new/*.csv) kolon adları farklı olabiliyor (Home/Away/HG/AG vs HomeTeam/AwayTeam/FTHG/FTAG)
+# Bu override, mevcut akışı bozmaz; sadece daha çok lig çalışır.
+def _normalize_history_v2(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
     d = df.copy()
     d.columns = [str(c).replace("\ufeff", "").strip() for c in d.columns]
     d = parse_dates(d)
 
-    # Case-insensitive resolver
     lower_map = {str(c).strip().lower(): c for c in d.columns}
 
     def pick(*cands: str) -> Optional[str]:
@@ -220,7 +234,6 @@ def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
     d["FTAG"] = pd.to_numeric(d["FTAG"], errors="coerce")
     d = d.dropna(subset=["FTHG", "FTAG"]).copy()
 
-    # Optional numeric columns
     for col in ["HTHG", "HTAG", "HS", "AS", "HST", "AST", "HC", "AC"]:
         if col in d.columns:
             d[col] = pd.to_numeric(d[col], errors="coerce")
@@ -228,9 +241,12 @@ def _normalize_history(df: pd.DataFrame, anchor_date: dt.date) -> pd.DataFrame:
     d = d[d["Date"] <= pd.Timestamp(anchor_date)].copy()
     d = d.sort_values("Date").drop_duplicates(
         subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"],
-        keep="last"
+        keep="last",
     )
     return d
+
+# override (load_history bunu runtime'da kullanır)
+_normalize_history = _normalize_history_v2
 
 @st.cache_data(show_spinner=False)
 def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple[pd.DataFrame, List[str], str]:
@@ -254,6 +270,7 @@ def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple
         except requests.HTTPError as e:
             if getattr(e, "response", None) is not None and e.response.status_code == 404:
                 continue
+            # Some other HTTP error
             continue
         except Exception:
             continue
@@ -267,6 +284,7 @@ def load_history(div: str, anchor_date: dt.date, back_seasons: int = 6) -> Tuple
     new_url = NEW_LEAGUE_URL.format(div=div)
     try:
         df = load_csv(new_url)
+        # Season might not exist in /new files; keep placeholder
         df["Season"] = "NEW"
         d = _normalize_history(df, anchor_date)
         return d, ["NEW"], "new"
@@ -493,7 +511,7 @@ def shrink_mean(values: np.ndarray, prior_mean: float, prior_weight: float) -> f
         return float(prior_mean)
     return float((v.sum() + prior_weight * prior_mean) / (n + prior_weight))
 
-# ✅ FIXED weighted averages
+# ✅ FIXED weighted averages (this is what was crashing T1 etc.)
 def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_days: int) -> Dict[str, float]:
     d = df_all.copy()
     last = pd.Timestamp(anchor_date)
@@ -821,7 +839,9 @@ if len(teams) < 4:
     st.warning("Yeterli takım verisi oluşmadı. min_matches düşür veya daha fazla data yükle.")
     st.stop()
 
-_, elo_final, glicko_final = compute_ratings(df_all, elo_k=elo_k, elo_home_adv=elo_home_adv, glicko_home_adv=glicko_home_adv)
+df_ratings_pre, elo_final, glicko_final = compute_ratings(
+    df_all, elo_k=elo_k, elo_home_adv=elo_home_adv, glicko_home_adv=glicko_home_adv
+)
 
 # =========================================================
 # LEAGUE GOALS PER MATCH
@@ -1005,3 +1025,579 @@ if fixtures_df is not None and not fixtures_df.empty:
         f = f.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).sort_values("Date")
         f = f[f["Date"] >= pd.Timestamp(anchor_date)]
         st.dataframe(f.head(25), use_container_width=True, height=420)
+
+# =========================================================
+# ✅ ADDITIONS — Market Odds (Edge/Value) + Backtest
+# =========================================================
+def kelly_fraction(p: float, odds: float) -> float:
+    """Kelly fraction for decimal odds. Returns 0 if no edge."""
+    if not (np.isfinite(p) and np.isfinite(odds)) or odds <= 1.0 or p <= 0 or p >= 1:
+        return 0.0
+    b = odds - 1.0
+    f = (p * odds - 1.0) / b
+    return float(max(0.0, f))
+
+def brier_1x2(pH_: float, pD_: float, pA_: float, y: int) -> float:
+    # y: 0=H,1=D,2=A
+    yv = np.array([1.0 if y == 0 else 0.0, 1.0 if y == 1 else 0.0, 1.0 if y == 2 else 0.0])
+    pv = np.array([pH_, pD_, pA_], dtype=float)
+    pv = np.clip(pv, 1e-9, 1.0)
+    pv = pv / pv.sum()
+    return float(((pv - yv) ** 2).mean())
+
+def logloss_1x2(pH_: float, pD_: float, pA_: float, y: int) -> float:
+    pv = np.array([pH_, pD_, pA_], dtype=float)
+    pv = np.clip(pv, 1e-12, 1.0)
+    pv = pv / pv.sum()
+    return float(-math.log(pv[y]))
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def backtest_1x2_value(
+    df_all_in: pd.DataFrame,
+    df_pre_in: pd.DataFrame,
+    anchor_date_in: dt.date,
+    odds_cols: Tuple[str, str, str],
+    lookback_in: int,
+    prior_weight_in: float,
+    min_matches_in: int,
+    half_life_days_in: int,
+    max_goals_in: int,
+    xg_weight_in: float,
+    elo_home_adv_in: float,
+    elo_to_goal_k_in: float,
+    edge_threshold_in: float,
+    max_eval_matches_in: int,
+    league_tail_n: int = 800,
+) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame]:
+    """
+    Leak-free-ish rolling evaluation using only past data per match,
+    with fast per-team rolling home/away histories (no full rebuild per step).
+    Evaluates on matches with valid odds columns.
+    Returns:
+      - results df
+      - summary metrics dict
+      - calibration table (home win) df
+    """
+    hcol, dcol, acol = odds_cols
+
+    d = df_all_in.copy()
+    d = d[d["Date"].notna()].copy()
+    d = d[d["Date"] <= pd.Timestamp(anchor_date_in)].copy()
+    d = d.sort_values("Date").reset_index(drop=True)
+
+    # Need odds rows
+    for c in [hcol, dcol, acol]:
+        if c not in d.columns:
+            return pd.DataFrame(), {"error": 1.0}, pd.DataFrame()
+
+    d[hcol] = pd.to_numeric(d[hcol], errors="coerce")
+    d[dcol] = pd.to_numeric(d[dcol], errors="coerce")
+    d[acol] = pd.to_numeric(d[acol], errors="coerce")
+
+    valid = (
+        d[hcol].notna() & d[dcol].notna() & d[acol].notna() &
+        (d[hcol] > 1.01) & (d[dcol] > 1.01) & (d[acol] > 1.01)
+    )
+    d = d[valid].copy().reset_index(drop=True)
+    if d.empty:
+        return pd.DataFrame(), {"error": 1.0}, pd.DataFrame()
+
+    # Only evaluate last N matches for speed
+    if max_eval_matches_in is not None and max_eval_matches_in > 0 and len(d) > max_eval_matches_in:
+        d = d.iloc[-max_eval_matches_in:].copy().reset_index(drop=True)
+
+    # Align pre-ratings: build map by (Date,Home,Away,FTHG,FTAG) -> row
+    # df_pre_in is same matches (may include non-odds matches). We'll merge by keys.
+    keys = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]
+    pre = df_pre_in[keys + ["EloHomePre", "EloAwayPre"]].copy()
+    pre["Date"] = pd.to_datetime(pre["Date"], errors="coerce")
+    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
+
+    merged = d.merge(pre, on=keys, how="left")
+    # If missing, fallback 1500
+    merged["EloHomePre"] = merged["EloHomePre"].fillna(1500.0)
+    merged["EloAwayPre"] = merged["EloAwayPre"].fillna(1500.0)
+
+    # rolling structures
+    home_hist_scored: Dict[str, List[float]] = {}
+    home_hist_conc: Dict[str, List[float]] = {}
+    away_hist_scored: Dict[str, List[float]] = {}
+    away_hist_conc: Dict[str, List[float]] = {}
+    # shots for xg proxy
+    home_hist_xgf: Dict[str, List[float]] = {}
+    home_hist_xga: Dict[str, List[float]] = {}
+    away_hist_xgf: Dict[str, List[float]] = {}
+    away_hist_xga: Dict[str, List[float]] = {}
+
+    # team total appearances count (for min_matches)
+    counts: Dict[str, int] = {}
+
+    # We need to "warm up" the histories using matches BEFORE first eval match (but within df_all_in up to anchor_date)
+    # Build warmup from all matches in df_all_in up to first eval match date, excluding eval window? Simplify:
+    # We'll just use df_all_in up to each match iteratively in chronological order using the eval subset itself
+    # BUT that underuses prior matches not in eval subset (non-odds rows). So instead, warm from full df_all_in up to anchor_date.
+    full = df_all_in.copy()
+    full = full[full["Date"].notna()].copy()
+    full["Date"] = pd.to_datetime(full["Date"], errors="coerce")
+    full = full[full["Date"] <= pd.Timestamp(anchor_date_in)].copy()
+    full = full.sort_values("Date").reset_index(drop=True)
+
+    # We'll iterate full matches, but only score matches that are in "merged" (odds-valid and last N).
+    # Create a set of match keys for eval
+    def mk(row) -> Tuple:
+        return (row["Date"], row["HomeTeam"], row["AwayTeam"], int(row["FTHG"]), int(row["FTAG"]), float(row[hcol]), float(row[dcol]), float(row[acol]))
+    eval_keys = set(mk(r) for _, r in merged.iterrows())
+
+    rows_out = []
+    # for calibration: home win prob vs actual
+    cal_bins = 10
+    cal_counts = np.zeros(cal_bins, dtype=int)
+    cal_sum_p = np.zeros(cal_bins, dtype=float)
+    cal_sum_y = np.zeros(cal_bins, dtype=float)
+
+    # helper: fast league averages on tail
+    def league_fast(tail_df: pd.DataFrame, asof: pd.Timestamp) -> Dict[str, float]:
+        dd = tail_df.copy()
+        dd = dd[dd["Date"].notna()].copy()
+        if dd.empty:
+            return {
+                "home_goals": 1.4, "away_goals": 1.1,
+                "has_shots": False, "home_xg": np.nan, "away_xg": np.nan,
+            }
+        days_ago = (asof - dd["Date"]).dt.days.clip(lower=0).to_numpy()
+        w = np.exp(-days_ago / float(max(10, half_life_days_in)))
+
+        def wavg(arr) -> float:
+            vals = np.asarray(pd.to_numeric(arr, errors="coerce"), dtype=float)
+            m = np.isfinite(vals)
+            if m.sum() == 0:
+                return float("nan")
+            return float(np.average(vals[m], weights=w[m]))
+
+        out = {
+            "home_goals": wavg(dd["FTHG"]),
+            "away_goals": wavg(dd["FTAG"]),
+            "has_shots": False,
+            "home_xg": float("nan"),
+            "away_xg": float("nan"),
+        }
+
+        if all(c in dd.columns for c in ["HS", "HST", "AS", "AST"]):
+            hs = pd.to_numeric(dd["HS"], errors="coerce")
+            hst = pd.to_numeric(dd["HST"], errors="coerce")
+            a_s = pd.to_numeric(dd["AS"], errors="coerce")
+            ast = pd.to_numeric(dd["AST"], errors="coerce")
+            hxg = 0.04 * hs + 0.08 * hst
+            axg = 0.04 * a_s + 0.08 * ast
+            out["has_shots"] = True
+            out["home_xg"] = wavg(hxg)
+            out["away_xg"] = wavg(axg)
+
+        return out
+
+    def get_last(lst_map: Dict[str, List[float]], team: str) -> np.ndarray:
+        lst = lst_map.get(team, [])
+        if not lst:
+            return np.array([], dtype=float)
+        return np.array(lst[-lookback_in:], dtype=float)
+
+    # Iterate full chronology
+    for idx in range(len(full)):
+        row = full.iloc[idx]
+        date = row["Date"]
+        ht = row["HomeTeam"]
+        at = row["AwayTeam"]
+        try:
+            fthg = int(row["FTHG"])
+            ftag = int(row["FTAG"])
+        except Exception:
+            continue
+
+        # update counts
+        counts[ht] = counts.get(ht, 0) + 1
+        counts[at] = counts.get(at, 0) + 1
+
+        # update home/away split histories
+        home_hist_scored.setdefault(ht, []).append(float(fthg))
+        home_hist_conc.setdefault(ht, []).append(float(ftag))
+        away_hist_scored.setdefault(at, []).append(float(ftag))
+        away_hist_conc.setdefault(at, []).append(float(fthg))
+
+        # xg proxy from shots (if present)
+        if all(c in full.columns for c in ["HS", "HST", "AS", "AST"]):
+            hs = safe_float(row.get("HS"))
+            hst = safe_float(row.get("HST"))
+            a_s = safe_float(row.get("AS"))
+            ast = safe_float(row.get("AST"))
+            hxg = xg_proxy(hs, hst)
+            axg = xg_proxy(a_s, ast)
+            # home team xg for/against in home match
+            home_hist_xgf.setdefault(ht, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+            home_hist_xga.setdefault(ht, []).append(float(axg) if np.isfinite(axg) else np.nan)
+            # away team xg for/against in away match
+            away_hist_xgf.setdefault(at, []).append(float(axg) if np.isfinite(axg) else np.nan)
+            away_hist_xga.setdefault(at, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+
+        # Score only if this match is in eval set AND odds exist in this row (same match key)
+        # We need odds from merged set, so try to locate it by date+teams+score+odds
+        oh = safe_float(row.get(hcol))
+        od = safe_float(row.get(dcol))
+        oa = safe_float(row.get(acol))
+        key = (date, ht, at, fthg, ftag, oh if np.isfinite(oh) else None, od if np.isfinite(od) else None, oa if np.isfinite(oa) else None)
+        # Slightly looser: check by date+teams+score+odds only if finite
+        if not (np.isfinite(oh) and np.isfinite(od) and np.isfinite(oa)):
+            continue
+        if (date, ht, at, fthg, ftag, float(oh), float(od), float(oa)) not in eval_keys:
+            continue
+
+        # Need enough history BEFORE this match. We currently included this match in histories.
+        # For leak-free, use histories excluding current match -> pop last, compute, then add back.
+        # We'll temporarily remove the last appended values for this match.
+        home_hist_scored[ht].pop()
+        home_hist_conc[ht].pop()
+        away_hist_scored[at].pop()
+        away_hist_conc[at].pop()
+        if all(c in full.columns for c in ["HS", "HST", "AS", "AST"]):
+            if ht in home_hist_xgf and len(home_hist_xgf[ht]) > 0:
+                home_hist_xgf[ht].pop()
+                home_hist_xga[ht].pop()
+            if at in away_hist_xgf and len(away_hist_xgf[at]) > 0:
+                away_hist_xgf[at].pop()
+                away_hist_xga[at].pop()
+
+        # counts also include current match; adjust for evaluation moment
+        counts[ht] -= 1
+        counts[at] -= 1
+
+        # min matches check
+        if counts.get(ht, 0) < min_matches_in or counts.get(at, 0) < min_matches_in:
+            # restore then continue
+            counts[ht] += 1
+            counts[at] += 1
+            home_hist_scored[ht].append(float(fthg))
+            home_hist_conc[ht].append(float(ftag))
+            away_hist_scored[at].append(float(ftag))
+            away_hist_conc[at].append(float(fthg))
+            if all(c in full.columns for c in ["HS", "HST", "AS", "AST"]):
+                hs = safe_float(row.get("HS"))
+                hst = safe_float(row.get("HST"))
+                a_s = safe_float(row.get("AS"))
+                ast = safe_float(row.get("AST"))
+                hxg = xg_proxy(hs, hst)
+                axg = xg_proxy(a_s, ast)
+                home_hist_xgf.setdefault(ht, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+                home_hist_xga.setdefault(ht, []).append(float(axg) if np.isfinite(axg) else np.nan)
+                away_hist_xgf.setdefault(at, []).append(float(axg) if np.isfinite(axg) else np.nan)
+                away_hist_xga.setdefault(at, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+            continue
+
+        # league averages using tail of full up to idx (exclusive)
+        start_tail = max(0, idx - league_tail_n)
+        tail_df = full.iloc[start_tail:idx].copy()
+        lg = league_fast(tail_df, asof=date)
+
+        # build split stats for this match teams
+        home_scored = shrink_mean(get_last(home_hist_scored, ht), lg["home_goals"], prior_weight_in)
+        home_conc = shrink_mean(get_last(home_hist_conc, ht), lg["away_goals"], prior_weight_in)
+        away_scored = shrink_mean(get_last(away_hist_scored, at), lg["away_goals"], prior_weight_in)
+        away_conc = shrink_mean(get_last(away_hist_conc, at), lg["home_goals"], prior_weight_in)
+
+        ha = home_scored / lg["home_goals"] if lg["home_goals"] and lg["home_goals"] > 0 else 1.0
+        hd = home_conc / lg["away_goals"] if lg["away_goals"] and lg["away_goals"] > 0 else 1.0
+        aa = away_scored / lg["away_goals"] if lg["away_goals"] and lg["away_goals"] > 0 else 1.0
+        ad = away_conc / lg["home_goals"] if lg["home_goals"] and lg["home_goals"] > 0 else 1.0
+
+        lam_h_goal = lg["home_goals"] * ha * ad
+        lam_a_goal = lg["away_goals"] * aa * hd
+        lam_h_pred, lam_a_pred = lam_h_goal, lam_a_goal
+
+        # xG blend if available
+        if xg_weight_in > 0 and lg.get("has_shots") and np.isfinite(lg.get("home_xg", np.nan)) and np.isfinite(lg.get("away_xg", np.nan)) and lg["home_xg"] > 0 and lg["away_xg"] > 0:
+            hxgf = shrink_mean(get_last(home_hist_xgf, ht), lg["home_xg"], prior_weight_in)
+            hxga = shrink_mean(get_last(home_hist_xga, ht), lg["away_xg"], prior_weight_in)
+            axgf = shrink_mean(get_last(away_hist_xgf, at), lg["away_xg"], prior_weight_in)
+            axga = shrink_mean(get_last(away_hist_xga, at), lg["home_xg"], prior_weight_in)
+
+            # multipliers
+            h_att = hxgf / lg["home_xg"] if lg["home_xg"] > 0 else 1.0
+            h_def = hxga / lg["away_xg"] if lg["away_xg"] > 0 else 1.0
+            a_att = axgf / lg["away_xg"] if lg["away_xg"] > 0 else 1.0
+            a_def = axga / lg["home_xg"] if lg["home_xg"] > 0 else 1.0
+
+            lam_h_xg = lg["home_goals"] * h_att * a_def
+            lam_a_xg = lg["away_goals"] * a_att * h_def
+
+            lam_h_pred = (1 - xg_weight_in) * lam_h_goal + xg_weight_in * lam_h_xg
+            lam_a_pred = (1 - xg_weight_in) * lam_a_goal + xg_weight_in * lam_a_xg
+
+        # Elo scaling: use df_pre_in if available for this match
+        # try lookup in merged (precomputed)
+        # simplest: find row in merged with same keys
+        mrow = merged[(merged["Date"] == date) & (merged["HomeTeam"] == ht) & (merged["AwayTeam"] == at) & (merged["FTHG"] == fthg) & (merged["FTAG"] == ftag)]
+        if not mrow.empty:
+            elo_home_pre = float(mrow.iloc[0]["EloHomePre"])
+            elo_away_pre = float(mrow.iloc[0]["EloAwayPre"])
+        else:
+            elo_home_pre = 1500.0
+            elo_away_pre = 1500.0
+
+        elo_diff_bt = (elo_home_pre + elo_home_adv_in) - elo_away_pre
+        scale = math.exp((elo_to_goal_k_in * elo_diff_bt) / 400.0)
+        lam_h_pred *= scale
+        lam_a_pred *= (1.0 / scale)
+
+        lam_h_pred = float(np.clip(lam_h_pred, 0.05, 4.5))
+        lam_a_pred = float(np.clip(lam_a_pred, 0.05, 4.5))
+
+        mat_bt = score_matrix(lam_h_pred, lam_a_pred, max_goals=max_goals_in)
+        pH_m, pD_m, pA_m = outcome_probs_from_mat(mat_bt)
+
+        # market implied
+        pH_mkt, pD_mkt, pA_mkt = implied_probs_1x2(float(oh), float(od), float(oa))
+
+        # outcome y
+        y = 0 if fthg > ftag else (2 if fthg < ftag else 1)
+
+        # value betting: pick best edge
+        edges = {
+            "H": pH_m - pH_mkt,
+            "D": pD_m - pD_mkt,
+            "A": pA_m - pA_mkt,
+        }
+        side = max(edges, key=lambda k: edges[k])
+        best_edge = float(edges[side])
+
+        bet = best_edge >= edge_threshold_in
+        profit = 0.0
+        odds_used = {"H": float(oh), "D": float(od), "A": float(oa)}[side]
+        if bet:
+            win = (y == 0 and side == "H") or (y == 1 and side == "D") or (y == 2 and side == "A")
+            profit = (odds_used - 1.0) if win else -1.0
+
+        # calibration (home win)
+        ph = float(np.clip(pH_m, 1e-9, 1.0))
+        b = min(cal_bins - 1, int(ph * cal_bins))  # 0..9
+        cal_counts[b] += 1
+        cal_sum_p[b] += ph
+        cal_sum_y[b] += 1.0 if y == 0 else 0.0
+
+        rows_out.append({
+            "Date": date.date() if hasattr(date, "date") else date,
+            "Home": ht,
+            "Away": at,
+            "Score": f"{fthg}-{ftag}",
+            "OddsH": float(oh),
+            "OddsD": float(od),
+            "OddsA": float(oa),
+            "Mkt_H": float(pH_mkt),
+            "Mkt_D": float(pD_mkt),
+            "Mkt_A": float(pA_mkt),
+            "Model_H": float(pH_m),
+            "Model_D": float(pD_m),
+            "Model_A": float(pA_m),
+            "BestSide": side,
+            "BestEdge": best_edge,
+            "Bet": bool(bet),
+            "Profit_1u": float(profit),
+            "Brier_Model": brier_1x2(pH_m, pD_m, pA_m, y),
+            "Brier_Mkt": brier_1x2(pH_mkt, pD_mkt, pA_mkt, y),
+            "LogLoss_Model": logloss_1x2(pH_m, pD_m, pA_m, y),
+            "LogLoss_Mkt": logloss_1x2(pH_mkt, pD_mkt, pA_mkt, y),
+        })
+
+        # restore histories + counts with current match (so future iterations have it)
+        counts[ht] += 1
+        counts[at] += 1
+        home_hist_scored[ht].append(float(fthg))
+        home_hist_conc[ht].append(float(ftag))
+        away_hist_scored[at].append(float(ftag))
+        away_hist_conc[at].append(float(fthg))
+        if all(c in full.columns for c in ["HS", "HST", "AS", "AST"]):
+            hs = safe_float(row.get("HS"))
+            hst = safe_float(row.get("HST"))
+            a_s = safe_float(row.get("AS"))
+            ast = safe_float(row.get("AST"))
+            hxg = xg_proxy(hs, hst)
+            axg = xg_proxy(a_s, ast)
+            home_hist_xgf.setdefault(ht, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+            home_hist_xga.setdefault(ht, []).append(float(axg) if np.isfinite(axg) else np.nan)
+            away_hist_xgf.setdefault(at, []).append(float(axg) if np.isfinite(axg) else np.nan)
+            away_hist_xga.setdefault(at, []).append(float(hxg) if np.isfinite(hxg) else np.nan)
+
+    res = pd.DataFrame(rows_out)
+    if res.empty:
+        return res, {"error": 1.0}, pd.DataFrame()
+
+    # summary
+    n = len(res)
+    brier_model = float(res["Brier_Model"].mean())
+    brier_mkt = float(res["Brier_Mkt"].mean())
+    ll_model = float(res["LogLoss_Model"].mean())
+    ll_mkt = float(res["LogLoss_Mkt"].mean())
+
+    bets = res[res["Bet"]].copy()
+    nb = len(bets)
+    profit = float(bets["Profit_1u"].sum()) if nb > 0 else 0.0
+    roi = float(profit / nb) if nb > 0 else 0.0
+    hit = float((bets["Profit_1u"] > 0).mean()) if nb > 0 else 0.0
+    avg_edge = float(bets["BestEdge"].mean()) if nb > 0 else 0.0
+    avg_odds = float(bets.apply(lambda r: {"H": r["OddsH"], "D": r["OddsD"], "A": r["OddsA"]}[r["BestSide"]], axis=1).mean()) if nb > 0 else 0.0
+
+    summary = {
+        "matches": n,
+        "brier_model": brier_model,
+        "brier_market": brier_mkt,
+        "logloss_model": ll_model,
+        "logloss_market": ll_mkt,
+        "bets": nb,
+        "profit_1u": profit,
+        "roi_per_bet": roi,
+        "hit_rate": hit,
+        "avg_edge": avg_edge,
+        "avg_odds": avg_odds,
+    }
+
+    # calibration table (home win)
+    cal_rows = []
+    for i in range(cal_bins):
+        if cal_counts[i] == 0:
+            continue
+        cal_rows.append({
+            "Bin": f"{i/cal_bins:.1f}-{(i+1)/cal_bins:.1f}",
+            "Count": int(cal_counts[i]),
+            "AvgPred(HomeWin)": float(cal_sum_p[i] / cal_counts[i]),
+            "Empirical(HomeWin)": float(cal_sum_y[i] / cal_counts[i]),
+        })
+    cal_df = pd.DataFrame(cal_rows)
+
+    return res.sort_values("Date"), summary, cal_df
+
+
+# ---- UI: Odds + Edge for CURRENT selected match (manual) ----
+st.divider()
+st.subheader("📊 Market Odds (1X2) → Model vs Market (Edge/Value)")
+
+with st.expander("Odds gir + edge/value hesapla (manual)"):
+    o1, ox, o2 = st.columns(3)
+    with o1:
+        in_h = st.number_input("Home odds", min_value=1.01, value=2.20, step=0.01)
+    with ox:
+        in_d = st.number_input("Draw odds", min_value=1.01, value=3.30, step=0.01)
+    with o2:
+        in_a = st.number_input("Away odds", min_value=1.01, value=3.10, step=0.01)
+
+    kelly_mult = st.slider("Kelly çarpanı (risk azaltma)", 0.0, 1.0, 0.50, 0.05)
+
+    mktH, mktD, mktA = implied_probs_1x2(float(in_h), float(in_d), float(in_a))
+
+    # model fair odds
+    fairH, fairD, fairA = (1/pH if pH > 0 else np.nan), (1/pD if pD > 0 else np.nan), (1/pA if pA > 0 else np.nan)
+    edgeH, edgeD, edgeA = (pH - mktH), (pD - mktD), (pA - mktA)
+
+    st.write("**Market implied probs (normalized):**")
+    st.write(f"H: **{mktH*100:.1f}%** | D: **{mktD*100:.1f}%** | A: **{mktA*100:.1f}%**")
+
+    st.write("**Model probs:**")
+    st.write(f"H: **{pH*100:.1f}%** | D: **{pD*100:.1f}%** | A: **{pA*100:.1f}%**")
+
+    st.write("**Edge (Model - Market):**")
+    st.write(f"H: **{edgeH*100:+.2f}%** | D: **{edgeD*100:+.2f}%** | A: **{edgeA*100:+.2f}%**")
+
+    # bet suggestion
+    edges = {"H": edgeH, "D": edgeD, "A": edgeA}
+    best_side = max(edges, key=lambda k: edges[k])
+    best_edge = float(edges[best_side])
+    odds_best = {"H": float(in_h), "D": float(in_d), "A": float(in_a)}[best_side]
+    p_best = {"H": float(pH), "D": float(pD), "A": float(pA)}[best_side]
+    fair_best = 1/p_best if p_best > 0 else np.nan
+
+    kelly = kelly_fraction(p_best, odds_best)
+    kelly_sized = kelly_mult * kelly
+
+    st.divider()
+    st.write(f"**En iyi value taraf:** `{best_side}` | Edge: **{best_edge*100:+.2f}%**")
+    st.write(f"Model fair odds: **{fair_best:.2f}** | Market odds: **{odds_best:.2f}**")
+    st.write(f"Kelly fraction: **{kelly*100:.2f}%** | Uygulanacak (çarpanlı): **{kelly_sized*100:.2f}%** (bankroll yüzdesi)")
+
+    if best_edge <= 0:
+        st.info("Model bu odds setinde net bir value görmüyor (edge <= 0).")
+
+# ---- UI: Backtest (1X2) ----
+st.divider()
+st.subheader("🧪 Odds Backtest (1X2) — Model vs Market + Value Betting")
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Backtest (1X2 odds)")
+    avail_sets = find_available_odds_sets(df_all)
+    if len(avail_sets) == 0:
+        st.caption("Bu lig datasında 1X2 odds kolonları bulunamadı.")
+        bt_set = None
+    else:
+        bt_set = st.selectbox("Odds set", avail_sets, index=0)
+    bt_n = st.slider("Backtest: kaç maç (son)", 100, 1200, 400, 50)
+    bt_edge = st.slider("Value threshold (edge)", 0.00, 0.10, 0.02, 0.005)
+    bt_run = st.button("Backtest çalıştır")
+
+with st.expander("Backtest sonuçları (aç)"):
+    if bt_set is None:
+        st.warning("Bu ligde odds kolonları yok. (Bazı extra liglerde odds eksik olabilir.)")
+    elif not bt_run:
+        st.info("Backtest için soldan **Backtest çalıştır** butonuna bas.")
+    else:
+        cols = get_odds_cols(bt_set)
+        if cols is None:
+            st.error("Odds set kolonları bulunamadı.")
+        else:
+            res_df, summary, cal_df = backtest_1x2_value(
+                df_all_in=df_all,
+                df_pre_in=df_ratings_pre,
+                anchor_date_in=anchor_date,
+                odds_cols=cols,
+                lookback_in=lookback,
+                prior_weight_in=prior_weight,
+                min_matches_in=min_matches,
+                half_life_days_in=half_life_days,
+                max_goals_in=max_goals,
+                xg_weight_in=xg_weight,
+                elo_home_adv_in=elo_home_adv,
+                elo_to_goal_k_in=elo_to_goal_k,
+                edge_threshold_in=bt_edge,
+                max_eval_matches_in=bt_n,
+            )
+
+            if "error" in summary and summary["error"] == 1.0:
+                st.error("Backtest çalıştırılamadı (muhtemelen yeterli odds/maç yok).")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Matches", f"{summary['matches']}")
+                m2.metric("Brier (Model vs Market)", f"{summary['brier_model']:.4f} | {summary['brier_market']:.4f}")
+                m3.metric("LogLoss (Model vs Market)", f"{summary['logloss_model']:.4f} | {summary['logloss_market']:.4f}")
+                m4.metric("Bets / ROI per bet", f"{summary['bets']} | {summary['roi_per_bet']*100:.2f}%")
+
+                st.write(
+                    f"Profit (1u staking): **{summary['profit_1u']:.2f}u** | "
+                    f"Hit rate: **{summary['hit_rate']*100:.1f}%** | "
+                    f"Avg edge: **{summary['avg_edge']*100:.2f}%** | "
+                    f"Avg odds: **{summary['avg_odds']:.2f}**"
+                )
+
+                st.markdown("#### Calibration (Home win) — basit kontrol")
+                if cal_df is None or cal_df.empty:
+                    st.info("Kalibrasyon tablosu üretilemedi (yetersiz veri).")
+                else:
+                    st.dataframe(cal_df, use_container_width=True, height=260)
+
+                st.markdown("#### En iyi value bet’ler (edge’e göre)")
+                if res_df is None or res_df.empty:
+                    st.info("Sonuç yok.")
+                else:
+                    show = res_df.copy()
+                    show["Edge%"] = (show["BestEdge"] * 100).round(2)
+                    show = show.sort_values("BestEdge", ascending=False)
+                    st.dataframe(show.head(50)[
+                        ["Date", "Home", "Away", "Score", "BestSide", "Edge%", "Bet", "Profit_1u", "OddsH", "OddsD", "OddsA", "Model_H", "Model_D", "Model_A", "Mkt_H", "Mkt_D", "Mkt_A"]
+                    ], use_container_width=True, height=420)
+
+                with st.expander("Tüm backtest satırları (debug)"):
+                    st.dataframe(res_df, use_container_width=True, height=520)
