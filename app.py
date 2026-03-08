@@ -514,12 +514,35 @@ def league_avgs_weighted(df_all: pd.DataFrame, anchor_date: dt.date, half_life_d
         out["away_corners"] = float("nan")
 
     out["has_shots"] = ("HS" in d.columns and "AS" in d.columns and "HST" in d.columns and "AST" in d.columns)
-    # xG coefficients will be added later
     return out
 
 # =========================================================
 # NEW FEATURES: Rest days, head-to-head, Dixon-Coles, decay
 # =========================================================
+
+# Define TeamRates dataclass
+@dataclass
+class TeamRates:
+    home_attack: float
+    home_def: float
+    away_attack: float
+    away_def: float
+    home_xg_att: Optional[float] = None
+    home_xg_def: Optional[float] = None
+    away_xg_att: Optional[float] = None
+    away_xg_def: Optional[float] = None
+    home_c_att: Optional[float] = None
+    home_c_def: Optional[float] = None
+    away_c_att: Optional[float] = None
+    away_c_def: Optional[float] = None
+    home_used: int = 0
+    away_used: int = 0
+
+def shrink_mean_with_prior(weighted_avg: float, prior_mean: float, prior_weight: float, n: int) -> float:
+    if np.isnan(weighted_avg):
+        return prior_mean
+    return (weighted_avg * n + prior_weight * prior_mean) / (n + prior_weight)
+
 def compute_rest_days(team: str, match_date: pd.Timestamp, all_matches: pd.DataFrame) -> int:
     prev = all_matches[
         (all_matches["Date"] < match_date) &
@@ -585,7 +608,7 @@ def build_team_rates_recent_decayed(
     prior_weight: float,
     min_matches: int,
     decay_halflife: float
-) -> Dict[str, "TeamRates"]:
+) -> Dict[str, TeamRates]:
     teams = sorted(set(df_all["HomeTeam"]).union(set(df_all["AwayTeam"])))
     rates: Dict[str, TeamRates] = {}
 
@@ -617,11 +640,6 @@ def build_team_rates_recent_decayed(
         away_scored = wavg(away["FTAG"], w_away) if len(away) > 0 else np.nan
         away_conceded = wavg(away["FTHG"], w_away) if len(away) > 0 else np.nan
 
-        def shrink_mean_with_prior(weighted_avg, prior_mean, prior_weight, n):
-            if np.isnan(weighted_avg):
-                return prior_mean
-            return (weighted_avg * n + prior_weight * prior_mean) / (n + prior_weight)
-
         home_scored = shrink_mean_with_prior(home_scored, league["home_goals"], prior_weight, len(home))
         home_conceded = shrink_mean_with_prior(home_conceded, league["away_goals"], prior_weight, len(home))
         away_scored = shrink_mean_with_prior(away_scored, league["away_goals"], prior_weight, len(away))
@@ -644,7 +662,7 @@ def build_team_rates_recent_decayed(
     return rates
 
 def expected_goals_from_rates_enhanced(
-    rates: Dict[str, "TeamRates"],
+    rates: Dict[str, TeamRates],
     league: Dict[str, float],
     home: str,
     away: str,
@@ -671,14 +689,8 @@ def expected_goals_from_rates_enhanced(
 
     lam_h, lam_a = lam_h_goal, lam_a_goal
 
-    # xG blend (if shots data available and xg_weight>0)
-    if xg_weight > 0 and league.get("has_shots", False):
-        # We need to compute xG multipliers for teams using shots data.
-        # For simplicity, we use the same attack/def multipliers but from xG proxy.
-        # In a full implementation, you would precompute these in rates.
-        # Here we approximate using the same rates (since we didn't store xg multipliers in decay version).
-        # To keep it simple, we skip xG blend in enhanced version; you could extend rates to include xg_att/def.
-        pass
+    # xG blend (if shots data available and xg_weight>0) - not implemented here due to missing xg rates
+    # You can extend rates to include xg_att/def if needed.
 
     # ELO scaling
     scale = math.exp((elo_to_goal_k * elo_diff) / 400.0)
@@ -823,37 +835,27 @@ def backtest_1x2_value_enhanced(
     merged["EloHomePre"] = merged["EloHomePre"].fillna(1500.0)
     merged["EloAwayPre"] = merged["EloAwayPre"].fillna(1500.0)
 
-    # We'll need full match list for rest days and h2h
     full = df_all_in.copy()
     full = full[full["Date"].notna()].copy()
     full["Date"] = pd.to_datetime(full["Date"], errors="coerce")
     full = full[full["Date"] <= pd.Timestamp(anchor_date_in)].copy()
     full = full.sort_values("Date").reset_index(drop=True)
 
-    # For rolling team stats, we'll use decay approach similar to build_team_rates_recent_decayed
-    # But we need to maintain histories per team as we iterate.
-    # We'll store lists for each team of goals scored/conceded in home/away matches.
     home_scored_list: Dict[str, List[float]] = {}
     home_conceded_list: Dict[str, List[float]] = {}
     away_scored_list: Dict[str, List[float]] = {}
     away_conceded_list: Dict[str, List[float]] = {}
     counts: Dict[str, int] = {}
 
-    # To avoid recomputing league averages for each match, we compute a rolling league average
-    # using a tail of matches before current date. We'll do it on the fly.
-
-    # For calibration: collect predictions and outcomes
     pred_list = []
     outcome_list = []
 
     rows_out = []
-    # For calibration table
     cal_bins = 10
     cal_counts = np.zeros(cal_bins, dtype=int)
     cal_sum_p = np.zeros(cal_bins, dtype=float)
     cal_sum_y = np.zeros(cal_bins, dtype=float)
 
-    # Helper: fast league averages on tail
     def league_fast(tail_df: pd.DataFrame, asof: pd.Timestamp) -> Dict[str, float]:
         dd = tail_df.copy()
         dd = dd[dd["Date"].notna()].copy()
@@ -879,12 +881,8 @@ def backtest_1x2_value_enhanced(
         }
         return out
 
-    # Precompute Dixon-Coles rho on full dataset (static)
     rho_global = dixon_coles_rho(full) if use_dixon_coles_in else 0.0
 
-    # Iterate through full in chronological order, but only evaluate on matches in merged
-    eval_keys_set = set(zip(merged["Date"], merged["HomeTeam"], merged["AwayTeam"], merged["FTHG"], merged["FTAG"]))
-    # Convert to tuple of (date, home, away, fthg, ftag) for fast lookup
     eval_set = {(row.Date, row.HomeTeam, row.AwayTeam, row.FTHG, row.FTAG) for row in merged.itertuples()}
 
     for idx in range(len(full)):
@@ -898,13 +896,9 @@ def backtest_1x2_value_enhanced(
         except Exception:
             continue
 
-        # Update counts and histories (before evaluation for this match, we add this match's data after evaluation)
-        # But for evaluation, we need histories excluding current match. So we'll add after evaluation.
-        # First check if this match is in eval set.
         is_eval = (date, ht, at, fthg, ftag) in eval_set
 
         if is_eval:
-            # Get odds from merged (they should be same row)
             odds_row = merged[(merged["Date"] == date) & (merged["HomeTeam"] == ht) & (merged["AwayTeam"] == at) & (merged["FTHG"] == fthg) & (merged["FTAG"] == ftag)]
             if odds_row.empty:
                 continue
@@ -914,20 +908,12 @@ def backtest_1x2_value_enhanced(
             elo_home_pre = float(odds_row.iloc[0]["EloHomePre"])
             elo_away_pre = float(odds_row.iloc[0]["EloAwayPre"])
         else:
-            # Still need to update histories for future matches, so we'll just add data later
             pass
 
-        # Before evaluation, we need to compute team rates using current histories (which do not include this match)
-        # So we compute rates on the fly using decay on the stored lists.
-
-        # Compute league average using tail up to idx-1
         start_tail = max(0, idx - league_tail_n)
         tail_df = full.iloc[start_tail:idx].copy()
         lg = league_fast(tail_df, asof=date)
 
-        # Compute rest days and h2h using full data up to idx-1 (since current match not yet added)
-        # For rest days, we need previous matches of each team
-        # We'll use the full dataframe up to idx-1 for that.
         prev_matches = full.iloc[:idx].copy()
         home_rest = compute_rest_days(ht, date, prev_matches)
         away_rest = compute_rest_days(at, date, prev_matches)
@@ -935,7 +921,6 @@ def backtest_1x2_value_enhanced(
 
         h2h_h, h2h_a = h2h_features(ht, at, prev_matches, n_last=5)
 
-        # Build team rates for ht and at using decay on stored lists
         def get_decayed_avg(lst: List[float], halflife: float) -> float:
             if not lst:
                 return np.nan
@@ -953,11 +938,10 @@ def backtest_1x2_value_enhanced(
         away_scored = get_decayed_avg(away_scored_list.get(at, []), decay_halflife_in)
         away_conceded = get_decayed_avg(away_conceded_list.get(at, []), decay_halflife_in)
 
-        # Shrink with prior
         def shrink_val(val, prior, weight, cnt):
             if np.isnan(val):
                 return prior
-            n_val = len(home_scored_list.get(ht, []))  # approximate count
+            n_val = len(home_scored_list.get(ht, []))
             return (val * n_val + weight * prior) / (n_val + weight)
 
         home_scored_s = shrink_val(home_scored, lg["home_goals"], prior_weight_in, 1)
@@ -970,18 +954,17 @@ def backtest_1x2_value_enhanced(
         aa = away_scored_s / lg["away_goals"] if lg["away_goals"] > 0 else 1.0
         ad = away_conceded_s / lg["home_goals"] if lg["home_goals"] > 0 else 1.0
 
-        # Fake rates dict for this match only
         class FakeRates:
             pass
         rates_fake = {
             ht: type('R', (), {'home_attack': ha, 'home_def': hd, 'away_attack': 1.0, 'away_def': 1.0})(),
             at: type('R', (), {'home_attack': 1.0, 'home_def': 1.0, 'away_attack': aa, 'away_def': ad})()
         }
-        # We don't have xg rates, so xg_weight will be ignored (set to 0)
+
         try:
             lam_h_pred, lam_a_pred = expected_goals_from_rates_enhanced(
                 rates_fake, lg, ht, at,
-                xg_weight=0.0,   # skip xg for simplicity in backtest
+                xg_weight=0.0,
                 elo_diff=(elo_home_pre + elo_home_adv_in) - elo_away_pre,
                 elo_to_goal_k=elo_to_goal_k_in,
                 manual_home_factor=1.0,
@@ -995,9 +978,7 @@ def backtest_1x2_value_enhanced(
                 h2h_weight=h2h_weight_in
             )
         except ValueError:
-            # If teams not in rates_fake (shouldn't happen)
             if not is_eval:
-                # Still need to update histories
                 pass
             continue
 
@@ -1008,9 +989,7 @@ def backtest_1x2_value_enhanced(
         pH_m, pD_m, pA_m = outcome_probs_from_mat(mat_bt)
 
         if is_eval:
-            # Market implied
             pH_mkt, pD_mkt, pA_mkt = implied_probs_1x2(oh, od, oa)
-
             y = 0 if fthg > ftag else (2 if fthg < ftag else 1)
 
             edges = {
@@ -1028,14 +1007,12 @@ def backtest_1x2_value_enhanced(
                 win = (y == 0 and side == "H") or (y == 1 and side == "D") or (y == 2 and side == "A")
                 profit = (odds_used - 1.0) if win else -1.0
 
-            # Calibration (home win)
             ph = float(np.clip(pH_m, 1e-9, 1.0))
             b = min(cal_bins - 1, int(ph * cal_bins))
             cal_counts[b] += 1
             cal_sum_p[b] += ph
             cal_sum_y[b] += 1.0 if y == 0 else 0.0
 
-            # Store predictions and outcomes for calibration model
             pred_list.append([pH_m, pD_m, pA_m])
             outcome_list.append(y)
 
@@ -1063,7 +1040,6 @@ def backtest_1x2_value_enhanced(
                 "LogLoss_Mkt": logloss_1x2(pH_mkt, pD_mkt, pA_mkt, y),
             })
 
-        # After evaluation (or if not eval), update histories with current match
         home_scored_list.setdefault(ht, []).append(float(fthg))
         home_conceded_list.setdefault(ht, []).append(float(ftag))
         away_scored_list.setdefault(at, []).append(float(ftag))
@@ -1115,7 +1091,6 @@ def backtest_1x2_value_enhanced(
         })
     cal_df = pd.DataFrame(cal_rows)
 
-    # Build calibration models using Platt scaling (logistic regression)
     calibration_models = None
     if len(pred_list) > 100:
         pred_arr = np.array(pred_list)
@@ -1357,12 +1332,6 @@ p_a_wtn = prob_win_to_nil(mat, "A")
 
 htft = htft_probs(lam_h, lam_a, ht_ratio_home, ht_ratio_away, max_goals=max_goals)
 
-# Corners (simplified, not using enhanced rates)
-corners = None
-if league.get("has_corners"):
-    # We don't have corner rates in enhanced version, so skip
-    pass
-
 with st.expander("📌 Son 20 maç (form)"):
     l, r = st.columns(2)
     with l:
@@ -1547,7 +1516,6 @@ with st.expander("Backtest sonuçları (aç)"):
             if "error" in summary and summary["error"] == 1.0:
                 st.error("Backtest çalıştırılamadı (muhtemelen yeterli odds/maç yok).")
             else:
-                # Save calibration models to session state
                 if cal_models is not None:
                     st.session_state.calibration_models = cal_models
                     st.success("Kalibrasyon modeli oluşturuldu ve kaydedildi.")
