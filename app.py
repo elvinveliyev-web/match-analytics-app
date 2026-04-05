@@ -220,6 +220,29 @@ def check_bullish_divergence(close: pd.Series, indicator: pd.Series, lookback: i
         pass
     return False
 
+# DEEPSEEK FIX: Bull Power / Ayı Uyumsuzluğu için eklendi
+def check_bearish_divergence(close: pd.Series, indicator: pd.Series, lookback: int = 30) -> bool:
+    if len(close) < lookback: return False
+    c = close.tail(lookback)
+    ind = indicator.tail(lookback)
+    try:
+        max_idx = c.values.argmax()
+        if max_idx < 5: return False
+        
+        prev_c = c.iloc[:max_idx-2]
+        if len(prev_c) < 3: return False
+        prev_max_idx = prev_c.values.argmax()
+        
+        p1, p2 = prev_c.iloc[prev_max_idx], c.iloc[max_idx]
+        i1, i2 = ind.iloc[prev_max_idx], ind.iloc[max_idx]
+        
+        # Fiyat daha yüksek tepe yaparken, indikatör daha düşük tepe yapıyorsa
+        if p2 > p1 and i2 < i1:
+            return True
+    except Exception:
+        pass
+    return False
+
 def adx_indicator(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     up = high - high.shift(1)
     down = low.shift(1) - low
@@ -229,7 +252,6 @@ def adx_indicator(high: pd.Series, low: pd.Series, close: pd.Series, period: int
     
     tr = true_range(high, low, close)
     
-    # GROK FIX: tr'nin index'ini pd.Series ile eslestiriyoruz.
     tr_smooth = pd.Series(tr, index=high.index).ewm(alpha=1/period, adjust=False).mean()
     pdm_smooth = plus_dm.ewm(alpha=1/period, adjust=False).mean()
     mdm_smooth = minus_dm.ewm(alpha=1/period, adjust=False).mean()
@@ -538,7 +560,6 @@ def backtest_long_only(
     time_stop_bars = cfg.get("time_stop_bars", 10)
     tp_mult = cfg.get("take_profit_mult", 2.0)
     
-    # GROK FIX: Risk kuralı eklendi
     risk_pct = float(cfg.get("risk_per_trade", 0.01)) 
 
     for i in range(len(df)):
@@ -550,7 +571,6 @@ def backtest_long_only(
             new_stop = price - cfg["atr_stop_mult"] * float(row["ATR"])
             stop = max(stop, new_stop) if pd.notna(stop) else new_stop
 
-        # GROK FIX: Eksik olan ALIM (ENTRY) bloğu ve Position Sizing eklendi
         if shares == 0 and entry_sig.iloc[i] == 1:
             atrv = float(row.get("ATR", np.nan))
             if pd.notna(atrv) and atrv > 0:
@@ -880,7 +900,7 @@ def fundamental_score_row(row: dict, mode: str, thresholds: dict) -> Tuple[float
 
 
 # =============================
-# Target price band / SR Levels (YENİ GÜÇ-HACİM-UZUNLUK EKLENTİSİ)
+# Target price band / SR Levels 
 # =============================
 def _swing_points(high: pd.Series, low: pd.Series, left: int = 2, right: int = 2):
     hs = []
@@ -896,7 +916,6 @@ def _swing_points(high: pd.Series, low: pd.Series, left: int = 2, right: int = 2
     return hs, ls
 
 def analyze_sr_levels(df: pd.DataFrame, lookback: int = 120, tol=0.015) -> List[dict]:
-    """Destek/Direnç seviyelerinin güç, hacim ve uzunluğunu analiz eder."""
     h = df["High"].tail(lookback).dropna()
     l = df["Low"].tail(lookback).dropna()
     c = df["Close"].tail(lookback).dropna()
@@ -913,7 +932,6 @@ def analyze_sr_levels(df: pd.DataFrame, lookback: int = 120, tol=0.015) -> List[
     if not raw_levels:
         return []
 
-    # Yakın seviyeleri grupla (Cluster)
     clusters = []
     for rl in raw_levels:
         placed = False
@@ -943,12 +961,10 @@ def analyze_sr_levels(df: pd.DataFrame, lookback: int = 120, tol=0.015) -> List[
         if num_touches == 0:
             continue
 
-        # 1. Uzunluk (Bar sayısı)
         first_touch_idx = touches.index[0]
         first_idx_num = df_lookback.index.get_loc(first_touch_idx)
         duration_bars = len(df_lookback) - first_idx_num
 
-        # 2. Hacim Oranı (%)
         if "Volume" in df_lookback.columns and not touches.empty:
             vol_at_level = float(touches["Volume"].mean())
         else:
@@ -956,10 +972,9 @@ def analyze_sr_levels(df: pd.DataFrame, lookback: int = 120, tol=0.015) -> List[
 
         vol_diff_pct = (vol_at_level / avg_vol_normal - 1.0) * 100.0
 
-        # 3. Güç Skoru Hesaplama (Temas Sayısı + Hacim Etkisi + Yaş)
-        score_touches = min(num_touches * 10, 40) # Maksimum 40 puan (4+ temas)
-        score_vol = min(max(vol_diff_pct / 2.0, 0), 35) # Maksimum 35 puan (+70% hacimde tam puan)
-        score_dur = min(duration_bars / 2.0, 25) # Maksimum 25 puan (50 bar eski ise tam puan)
+        score_touches = min(num_touches * 10, 40) 
+        score_vol = min(max(vol_diff_pct / 2.0, 0), 35) 
+        score_dur = min(duration_bars / 2.0, 25) 
 
         strength_pct = min(score_touches + score_vol + score_dur, 99.0)
 
@@ -980,7 +995,6 @@ def target_price_band(df: pd.DataFrame):
     px_close = float(last["Close"])
     atrv = float(last["ATR"]) if pd.notna(last.get("ATR", np.nan)) else np.nan
 
-    # Detaylı S/R hesaplamasını al (Güç, Hacim, Uzunluk vb.)
     lv_details = analyze_sr_levels(df)
 
     if not np.isfinite(atrv) or atrv <= 0:
@@ -1148,7 +1162,6 @@ def get_news_sentiment(
             
         root = ET.fromstring(resp.content)
         
-        # SADECE BAŞLIK DEĞİL, LİNKLERİ DE ÇEKİYORUZ
         news_items = []
         for item in root.findall(".//item")[:10]:
             title_node = item.find("title")
@@ -1199,7 +1212,7 @@ Haber Başlıkları:
             "pos": pos / total if total > 0 else 0,
             "neg": neg / total if total > 0 else 0,
             "neu": neu / total if total > 0 else 0,
-            "news_items": news_items[:5], # SADECE İLK 5 HABERİ LİNK OLARAK DÖNDÜR
+            "news_items": news_items[:5], 
         }
     except Exception as e:
         return {"error": str(e), "sentiment": None, "summary": ""}
@@ -1936,7 +1949,7 @@ def generate_pdf_report(
 
 
 # =============================
-# RR helper (DİNAMİK PRICE ACTION GÜNCELLEMESİ)
+# RR helper 
 # =============================
 def rr_from_atr_stop(latest_row: pd.Series, tp_dict: dict, cfg: dict):
     close = float(latest_row["Close"])
@@ -1945,7 +1958,6 @@ def rr_from_atr_stop(latest_row: pd.Series, tp_dict: dict, cfg: dict):
     if not np.isfinite(atrv) or atrv <= 0:
         return {"rr": None, "stop": None, "risk": None, "reward": None}
 
-    # GROK FIX: KANGURU KUYRUĞU STOP-LOSS ENTEGRASYONU (0.1 yerine 0.5 yapıldı)
     if latest_row.get("KANGAROO_BULL", 0) == 1:
         stop = float(latest_row["Low"]) - (0.5 * atrv)
     else:
@@ -1994,7 +2006,7 @@ def pct_dist(level: float, base: float):
 
 
 # =============================
-# Cached data loader (HACK EKLENDİ)
+# Cached data loader (DEEPSEEK FIX: Güvenlik Eklendi)
 # =============================
 @st.cache_data(ttl=300, show_spinner=False)
 def load_data_cached(ticker: str, period: str, interval: str, end_date=None, force_latest: bool = False) -> pd.DataFrame:
@@ -2034,25 +2046,28 @@ def load_data_cached(ticker: str, period: str, interval: str, end_date=None, for
                 last_df_date = df.index[-1].date()
                 
                 if today_date > last_df_date:
-                    o = float(today_data["Open"].iloc[0])
-                    h = float(today_data["High"].max())
-                    l = float(today_data["Low"].min())
-                    c = float(today_data["Close"].iloc[-1])
                     v = float(today_data["Volume"].sum())
                     
-                    new_idx = pd.to_datetime(str(today_date))
-                    if df.index.tz is not None:
-                        new_idx = new_idx.tz_localize(df.index.tz)
+                    # DEEPSEEK FIX: Hacim 0 ise muhtemelen kapalı piyasa hatasıdır, ekleme yapma.
+                    if v > 0:
+                        o = float(today_data["Open"].iloc[0])
+                        h = float(today_data["High"].max())
+                        l = float(today_data["Low"].min())
+                        c = float(today_data["Close"].iloc[-1])
                         
-                    new_row = pd.DataFrame({
-                        "Open": [o],
-                        "High": [h],
-                        "Low": [l],
-                        "Close": [c],
-                        "Volume": [v]
-                    }, index=[new_idx])
-                    
-                    df = pd.concat([df, new_row])
+                        new_idx = pd.to_datetime(str(today_date))
+                        if df.index.tz is not None:
+                            new_idx = new_idx.tz_localize(df.index.tz)
+                            
+                        new_row = pd.DataFrame({
+                            "Open": [o],
+                            "High": [h],
+                            "Low": [l],
+                            "Close": [c],
+                            "Volume": [v]
+                        }, index=[new_idx])
+                        
+                        df = pd.concat([df, new_row])
         except Exception:
             pass
             
@@ -3392,7 +3407,6 @@ with tab_triple:
     if not st.session_state.ta_ran:
         st.info("Sol menüden 'Teknik Analizi Çalıştır' butonuna basarak sistemi aktifleştirmelisin.")
     else:
-        # GROK FIX: Buton state eklendi, böylece tablarda gezinirken ekran kaybolmaz.
         if st.button("Üçlü Ekran Verilerini Getir ve Analiz Et", key="run_triple"):
             st.session_state.run_triple_screen = True
             
@@ -3523,6 +3537,9 @@ with tab_triple:
                         div_stoch = check_bullish_divergence(df_1d["Close"], stoch_k)
                         div_er = check_bullish_divergence(df_1d["Close"], bear_p)
                         
+                        # DEEPSEEK FIX: Bull Power Divergence kontrolü eklendi
+                        div_er_bear = check_bearish_divergence(df_1d["Close"], bull_p)
+                        
                         adx_1d, pdi_1d, mdi_1d = adx_indicator(df_1d["High"], df_1d["Low"], df_1d["Close"])
                         adx_val_1d = adx_1d.iloc[-1]
                         pdi_val_1d = pdi_1d.iloc[-1]
@@ -3545,6 +3562,9 @@ with tab_triple:
                         if div_rsi: st.success("🚀 RSI(13)'te **Pozitif Uyumsuzluk** tespit edildi!")
                         if div_stoch: st.success("🚀 Stokastik(5)'te **Pozitif Uyumsuzluk** tespit edildi!")
                         if div_er: st.success("🚀 Elder-Ray Bear Power'da **Pozitif Uyumsuzluk (Boğa Uyumsuzluğu)** tespit edildi!")
+                        
+                        # DEEPSEEK FIX: Bull Power Divergence uyarısı eklendi
+                        if div_er_bear: st.warning("⚠️ Elder-Ray Bull Power'da **Negatif Uyumsuzluk (Ayı Uyumsuzluğu)** tespit edildi!")
                         
                         if st.session_state.sentiment_summary:
                             st.info(f"**Haber Etkisi Modülü:** {st.session_state.sentiment_summary}")
