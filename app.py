@@ -224,13 +224,13 @@ def adx_indicator(high: pd.Series, low: pd.Series, close: pd.Series, period: int
     up = high - high.shift(1)
     down = low.shift(1) - low
     
-    # DÜZELTME: pandas indeksleri (tarihler) eşleştirildi
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=high.index)
     minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=high.index)
     
     tr = true_range(high, low, close)
     
-    tr_smooth = pd.Series(tr).ewm(alpha=1/period, adjust=False).mean()
+    # GROK FIX: tr'nin index'ini pd.Series ile eslestiriyoruz.
+    tr_smooth = pd.Series(tr, index=high.index).ewm(alpha=1/period, adjust=False).mean()
     pdm_smooth = plus_dm.ewm(alpha=1/period, adjust=False).mean()
     mdm_smooth = minus_dm.ewm(alpha=1/period, adjust=False).mean()
     
@@ -262,10 +262,7 @@ def add_kangaroo_tails(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     atr_approx = trange.rolling(10).mean()
     valid_trange = trange > 0
     
-    # Bullish: Low is lowest of N days, body is small, lower wick is huge
     bull_cond = valid_trange & (df["Low"] == rolling_min) & ((body / trange) <= 0.3) & ((lower_wick / trange) >= 0.6) & (trange >= atr_approx * 0.8)
-    
-    # Bearish: High is highest of N days, body is small, upper wick is huge
     bear_cond = valid_trange & (df["High"] == rolling_max) & ((body / trange) <= 0.3) & ((upper_wick / trange) >= 0.6) & (trange >= atr_approx * 0.8)
     
     df.loc[bull_cond, "KANGAROO_BULL"] = 1
@@ -540,6 +537,9 @@ def backtest_long_only(
     slippage = cfg["slippage_bps"] / 10000.0
     time_stop_bars = cfg.get("time_stop_bars", 10)
     tp_mult = cfg.get("take_profit_mult", 2.0)
+    
+    # GROK FIX: Risk kuralı eklendi
+    risk_pct = float(cfg.get("risk_per_trade", 0.01)) 
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -549,6 +549,31 @@ def backtest_long_only(
         if shares > 0 and pd.notna(row["ATR"]) and row["ATR"] > 0:
             new_stop = price - cfg["atr_stop_mult"] * float(row["ATR"])
             stop = max(stop, new_stop) if pd.notna(stop) else new_stop
+
+        # GROK FIX: Eksik olan ALIM (ENTRY) bloğu ve Position Sizing eklendi
+        if shares == 0 and entry_sig.iloc[i] == 1:
+            atrv = float(row.get("ATR", np.nan))
+            if pd.notna(atrv) and atrv > 0:
+                risk_amount = cash * risk_pct
+                stop_dist = cfg["atr_stop_mult"] * atrv
+                
+                potential_shares = risk_amount / stop_dist
+                max_shares = cash / (price * (1 + slippage + commission))
+                shares_to_buy = min(potential_shares, max_shares)
+                
+                if shares_to_buy > 0.001: 
+                    shares = shares_to_buy
+                    entry_price = price * (1 + slippage)
+                    fee = (shares * entry_price) * commission
+                    cash -= ((shares * entry_price) + fee)
+                    
+                    stop = entry_price - stop_dist
+                    target_price = entry_price + (tp_mult * stop_dist)
+                    trades.append({
+                        "entry_date": date, 
+                        "entry_price": entry_price, 
+                        "equity_before": cash + (shares * price)
+                    })
 
         position_value = shares * price * (1 - slippage)
         equity = cash + position_value
@@ -1920,9 +1945,9 @@ def rr_from_atr_stop(latest_row: pd.Series, tp_dict: dict, cfg: dict):
     if not np.isfinite(atrv) or atrv <= 0:
         return {"rr": None, "stop": None, "risk": None, "reward": None}
 
-    # KANGURU KUYRUĞU STOP-LOSS ENTEGRASYONU
+    # GROK FIX: KANGURU KUYRUĞU STOP-LOSS ENTEGRASYONU (0.1 yerine 0.5 yapıldı)
     if latest_row.get("KANGAROO_BULL", 0) == 1:
-        stop = float(latest_row["Low"]) - (0.1 * atrv) # Kuyruk ucunun çok az altı
+        stop = float(latest_row["Low"]) - (0.5 * atrv)
     else:
         stop = close - (float(cfg["atr_stop_mult"]) * atrv)
         
@@ -2646,7 +2671,6 @@ tp = target_price_band(df)
 rr_info = rr_from_atr_stop(latest, tp, cfg)
 overbought_result = detect_speculation(df)
 
-# YENİ KOD: Short Data verilerini çek ve overbought sözlüğüne ekle
 short_info = get_short_info(ticker)
 overbought_result["short_percent_float"] = short_info["short_percent_float"]
 overbought_result["short_ratio"] = short_info["short_ratio"]
@@ -2755,7 +2779,6 @@ fig_eq.update_layout(
     xaxis_title="Tarih",
 )
 
-# YENİ EKLENEN GRAFİKLER (Hacim Kıyaslamaları ve OBV)
 df["VOL_SMA_10"] = df["Volume"].rolling(10).mean()
 if benchmark_df is not None and not benchmark_df.empty:
     bench_vol = benchmark_df["Volume"].reindex(df.index).fillna(0)
@@ -2801,19 +2824,15 @@ tab_dash, tab_export, tab_heatmap, tab_triple = st.tabs(["📊 Dashboard", "📄
 
 
 with tab_dash:
-    
-    # --- YENİ EKLENTİ: Gecikmeli Veri Uyarısı ---
     if interval == "1d" and not force_latest_candle and not df.empty:
         last_date = df.index[-1].date()
         today_date = datetime.date.today()
-        # Hafta içi mi kontrolü (0=Pazartesi, 4=Cuma)
         if today_date > last_date and today_date.weekday() < 5:
             st.warning(
                 f"⚠️ **Gecikmeli Veri Uyarısı:** Grafikteki son mum dünün ({last_date.strftime('%d.%m.%Y')}) tarihine ait. "
                 "Yahoo Finance bugünün günlük mumunu henüz kapatmamış/güncellememiş görünüyor. "
                 "Sol menüden **'Eksik Güncel Mumu Zorla Ekle'** seçeneğini işaretleyerek bugünün güncel fiyatını grafiğe dahil edebilirsiniz."
             )
-    # --------------------------------------------
 
     if use_fa and not st.session_state.screener_df.empty:
         st.subheader(f"🧾 Fundamental Screener Sonuçları ({market})")
@@ -3373,7 +3392,11 @@ with tab_triple:
     if not st.session_state.ta_ran:
         st.info("Sol menüden 'Teknik Analizi Çalıştır' butonuna basarak sistemi aktifleştirmelisin.")
     else:
+        # GROK FIX: Buton state eklendi, böylece tablarda gezinirken ekran kaybolmaz.
         if st.button("Üçlü Ekran Verilerini Getir ve Analiz Et", key="run_triple"):
+            st.session_state.run_triple_screen = True
+            
+        if st.session_state.get("run_triple_screen", False):
             with st.spinner("3 Ekran verileri hesaplanıyor (1W, 1D, 4H)..."):
                 
                 df_1w = load_data_cached(ticker, "2y", "1wk")
