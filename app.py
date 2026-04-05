@@ -220,7 +220,6 @@ def check_bullish_divergence(close: pd.Series, indicator: pd.Series, lookback: i
         pass
     return False
 
-# DEEPSEEK FIX: Bull Power / Ayı Uyumsuzluğu için eklendi
 def check_bearish_divergence(close: pd.Series, indicator: pd.Series, lookback: int = 30) -> bool:
     if len(close) < lookback: return False
     c = close.tail(lookback)
@@ -236,7 +235,6 @@ def check_bearish_divergence(close: pd.Series, indicator: pd.Series, lookback: i
         p1, p2 = prev_c.iloc[prev_max_idx], c.iloc[max_idx]
         i1, i2 = ind.iloc[prev_max_idx], ind.iloc[max_idx]
         
-        # Fiyat daha yüksek tepe yaparken, indikatör daha düşük tepe yapıyorsa
         if p2 > p1 and i2 < i1:
             return True
     except Exception:
@@ -571,11 +569,19 @@ def backtest_long_only(
             new_stop = price - cfg["atr_stop_mult"] * float(row["ATR"])
             stop = max(stop, new_stop) if pd.notna(stop) else new_stop
 
+        # CLAUDE FIX & KANGAROO FIX: Dinamik Kanguru Stop-Loss hesabı eklendi
         if shares == 0 and entry_sig.iloc[i] == 1:
             atrv = float(row.get("ATR", np.nan))
             if pd.notna(atrv) and atrv > 0:
                 risk_amount = cash * risk_pct
-                stop_dist = cfg["atr_stop_mult"] * atrv
+                
+                is_kangaroo = int(row.get("KANGAROO_BULL", 0)) == 1
+                if is_kangaroo:
+                    stop_price = float(row["Low"]) - (0.5 * atrv)
+                    stop_dist = price - stop_price
+                else:
+                    stop_dist = cfg["atr_stop_mult"] * atrv
+                    stop_price = price - stop_dist
                 
                 potential_shares = risk_amount / stop_dist
                 max_shares = cash / (price * (1 + slippage + commission))
@@ -587,7 +593,7 @@ def backtest_long_only(
                     fee = (shares * entry_price) * commission
                     cash -= ((shares * entry_price) + fee)
                     
-                    stop = entry_price - stop_dist
+                    stop = stop_price  # Dinamik belirlenen stop
                     target_price = entry_price + (tp_mult * stop_dist)
                     trades.append({
                         "entry_date": date, 
@@ -938,7 +944,8 @@ def analyze_sr_levels(df: pd.DataFrame, lookback: int = 120, tol=0.015) -> List[
         for cl in clusters:
             if abs(rl - cl['center']) / cl['center'] <= tol:
                 cl['points'].append(rl)
-                cl['center'] = sum(cl['points'])/len(cl['points'])
+                # CLAUDE FIX: Drift'i engellemek için center (merkez) güncellenmiyor. 
+                # İlk yakalanan güçlü seviye referans alınır.
                 placed = True
                 break
         if not placed:
@@ -2006,7 +2013,7 @@ def pct_dist(level: float, base: float):
 
 
 # =============================
-# Cached data loader (DEEPSEEK FIX: Güvenlik Eklendi)
+# Cached data loader
 # =============================
 @st.cache_data(ttl=300, show_spinner=False)
 def load_data_cached(ticker: str, period: str, interval: str, end_date=None, force_latest: bool = False) -> pd.DataFrame:
@@ -2048,7 +2055,6 @@ def load_data_cached(ticker: str, period: str, interval: str, end_date=None, for
                 if today_date > last_df_date:
                     v = float(today_data["Volume"].sum())
                     
-                    # DEEPSEEK FIX: Hacim 0 ise muhtemelen kapalı piyasa hatasıdır, ekleme yapma.
                     if v > 0:
                         o = float(today_data["Open"].iloc[0])
                         h = float(today_data["High"].max())
@@ -2706,10 +2712,11 @@ exits = df[df["EXIT"] == 1]
 fig_price.add_trace(go.Scatter(x=entries.index, y=entries["Close"], mode="markers", name="ENTRY", marker=dict(symbol="triangle-up", size=10)))
 fig_price.add_trace(go.Scatter(x=exits.index, y=exits["Close"], mode="markers", name="EXIT", marker=dict(symbol="triangle-down", size=10)))
 
+# YENİ EKLENTİ: Kanguruların renkleri Boğa(Yeşil/AL) ve Ayı(Kırmızı/SAT) olarak güncellendi.
 bull_tails = df[df["KANGAROO_BULL"] == 1]
 bear_tails = df[df["KANGAROO_BEAR"] == 1]
-fig_price.add_trace(go.Scatter(x=bull_tails.index, y=bull_tails["Low"], mode="markers+text", name="Kanguru (Boğa)", text="🦘", textposition="bottom center", marker=dict(symbol="circle", size=8, color="purple")))
-fig_price.add_trace(go.Scatter(x=bear_tails.index, y=bear_tails["High"], mode="markers+text", name="Kanguru (Ayı)", text="🦘", textposition="top center", marker=dict(symbol="circle", size=8, color="purple")))
+fig_price.add_trace(go.Scatter(x=bull_tails.index, y=bull_tails["Low"], mode="markers+text", name="Kanguru (AL/Boğa)", text="🦘", textposition="bottom center", marker=dict(symbol="circle", size=8, color="green")))
+fig_price.add_trace(go.Scatter(x=bear_tails.index, y=bear_tails["High"], mode="markers+text", name="Kanguru (SAT/Ayı)", text="🦘", textposition="top center", marker=dict(symbol="circle", size=8, color="red")))
 
 fig_price.update_layout(
     height=600,
@@ -3536,8 +3543,6 @@ with tab_triple:
                         div_rsi = check_bullish_divergence(df_1d["Close"], rsi13)
                         div_stoch = check_bullish_divergence(df_1d["Close"], stoch_k)
                         div_er = check_bullish_divergence(df_1d["Close"], bear_p)
-                        
-                        # DEEPSEEK FIX: Bull Power Divergence kontrolü eklendi
                         div_er_bear = check_bearish_divergence(df_1d["Close"], bull_p)
                         
                         adx_1d, pdi_1d, mdi_1d = adx_indicator(df_1d["High"], df_1d["Low"], df_1d["Close"])
@@ -3562,8 +3567,6 @@ with tab_triple:
                         if div_rsi: st.success("🚀 RSI(13)'te **Pozitif Uyumsuzluk** tespit edildi!")
                         if div_stoch: st.success("🚀 Stokastik(5)'te **Pozitif Uyumsuzluk** tespit edildi!")
                         if div_er: st.success("🚀 Elder-Ray Bear Power'da **Pozitif Uyumsuzluk (Boğa Uyumsuzluğu)** tespit edildi!")
-                        
-                        # DEEPSEEK FIX: Bull Power Divergence uyarısı eklendi
                         if div_er_bear: st.warning("⚠️ Elder-Ray Bull Power'da **Negatif Uyumsuzluk (Ayı Uyumsuzluğu)** tespit edildi!")
                         
                         if st.session_state.sentiment_summary:
