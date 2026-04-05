@@ -220,6 +220,7 @@ def check_bullish_divergence(close: pd.Series, indicator: pd.Series, lookback: i
         pass
     return False
 
+# DEEPSEEK FIX: Ayı uyumsuzluğu tespiti
 def check_bearish_divergence(close: pd.Series, indicator: pd.Series, lookback: int = 30) -> bool:
     if len(close) < lookback: return False
     c = close.tail(lookback)
@@ -569,7 +570,7 @@ def backtest_long_only(
             new_stop = price - cfg["atr_stop_mult"] * float(row["ATR"])
             stop = max(stop, new_stop) if pd.notna(stop) else new_stop
 
-        # CLAUDE FIX & KANGAROO FIX: Dinamik Kanguru Stop-Loss hesabı eklendi
+        # CLAUDE FIX: Backtest'te Kanguru formasyonuna göre Stop-Loss uyarlanması
         if shares == 0 and entry_sig.iloc[i] == 1:
             atrv = float(row.get("ATR", np.nan))
             if pd.notna(atrv) and atrv > 0:
@@ -593,7 +594,7 @@ def backtest_long_only(
                     fee = (shares * entry_price) * commission
                     cash -= ((shares * entry_price) + fee)
                     
-                    stop = stop_price  # Dinamik belirlenen stop
+                    stop = stop_price  # Dinamik belirlenen stop atanıyor
                     target_price = entry_price + (tp_mult * stop_dist)
                     trades.append({
                         "entry_date": date, 
@@ -2712,11 +2713,31 @@ exits = df[df["EXIT"] == 1]
 fig_price.add_trace(go.Scatter(x=entries.index, y=entries["Close"], mode="markers", name="ENTRY", marker=dict(symbol="triangle-up", size=10)))
 fig_price.add_trace(go.Scatter(x=exits.index, y=exits["Close"], mode="markers", name="EXIT", marker=dict(symbol="triangle-down", size=10)))
 
-# YENİ EKLENTİ: Kanguruların renkleri Boğa(Yeşil/AL) ve Ayı(Kırmızı/SAT) olarak güncellendi.
+# YENİ EKLENTİ: Kanguruları artık emojinin ötesinde renklendirilmiş OKLAR ve YAZILAR ile belirliyoruz.
 bull_tails = df[df["KANGAROO_BULL"] == 1]
 bear_tails = df[df["KANGAROO_BEAR"] == 1]
-fig_price.add_trace(go.Scatter(x=bull_tails.index, y=bull_tails["Low"], mode="markers+text", name="Kanguru (AL/Boğa)", text="🦘", textposition="bottom center", marker=dict(symbol="circle", size=8, color="green")))
-fig_price.add_trace(go.Scatter(x=bear_tails.index, y=bear_tails["High"], mode="markers+text", name="Kanguru (SAT/Ayı)", text="🦘", textposition="top center", marker=dict(symbol="circle", size=8, color="red")))
+
+fig_price.add_trace(go.Scatter(
+    x=bull_tails.index, 
+    y=bull_tails["Low"], 
+    mode="markers+text", 
+    name="Kanguru (AL/Boğa)", 
+    text="🟩🦘 LONG", 
+    textposition="bottom center", 
+    textfont=dict(color="green", size=13, family="Arial Black"),
+    marker=dict(symbol="triangle-up", size=14, color="green", line=dict(width=2, color="DarkSlateGrey"))
+))
+
+fig_price.add_trace(go.Scatter(
+    x=bear_tails.index, 
+    y=bear_tails["High"], 
+    mode="markers+text", 
+    name="Kanguru (SAT/Ayı)", 
+    text="🟥🦘 SHORT", 
+    textposition="top center", 
+    textfont=dict(color="red", size=13, family="Arial Black"),
+    marker=dict(symbol="triangle-down", size=14, color="red", line=dict(width=2, color="DarkSlateGrey"))
+))
 
 fig_price.update_layout(
     height=600,
@@ -2827,7 +2848,7 @@ fig_obv.update_layout(height=260, title="On-Balance Volume (OBV)", yaxis_title="
 figs_for_report = {
     "Price + EMA + Bollinger + Signals": fig_price,
     "RSI": fig_rsi,
-    "MACD": fig_macd,
+    "MACD":: fig_macd,
     "ATR%": fig_atr,
     "Stochastic RSI": fig_stoch,
     "Bollinger Band Width": fig_bbwidth,
